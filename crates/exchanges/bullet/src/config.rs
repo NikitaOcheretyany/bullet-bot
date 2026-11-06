@@ -1,0 +1,90 @@
+use std::path::PathBuf;
+
+use secrecy::SecretString;
+use serde::Deserialize;
+
+/// Configuration for the Bullet exchange adapter.
+///
+/// Key material is resolved in this precedence order — explicit config wins,
+/// and an env var only fills a field the config omits (so an ambient env var
+/// can't silently switch wallets):
+///
+/// 1. **`key_file`** (config) — path to a file containing the key string (as written by `bb-bot
+///    keygen`). Preferred: the key lives on disk with whatever permissions the filesystem enforces,
+///    never hits the shell history, and isn't trivially exfiltrated via a process environment dump.
+/// 2. **`BB_BULLET_KEY_FILE`** (env) — same key-file path, supplied via the environment.
+/// 3. **`private_key`** (config) — Ed25519 secret as a **base58** (Phantom / delegation export) or
+///    hex string. Wrapped in [`SecretString`] so it's redacted in `Debug` output and zeroed on
+///    drop.
+/// 4. **`BB_BULLET_PRIVATE_KEY`** (env) — same secret string, for CI / ephemeral contexts.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BulletConfig {
+    /// Network to connect to: "mainnet" or "testnet".
+    pub network: String,
+
+    /// Path to a file containing the key string (base58 or hex). Takes
+    /// precedence over `private_key` when set.
+    #[serde(default)]
+    pub key_file: Option<PathBuf>,
+
+    /// Ed25519 private key as a **base58** (preferred) or hex string. Only used
+    /// if `key_file` is not set.
+    #[serde(default = "default_secret")]
+    pub private_key: SecretString,
+}
+
+fn default_secret() -> SecretString {
+    SecretString::from(String::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use secrecy::ExposeSecret;
+
+    use super::*;
+
+    const FAKE_KEY: &str = "deadbeefcafef00d0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn debug_redacts_private_key() {
+        let cfg = BulletConfig {
+            network: "testnet".into(),
+            key_file: None,
+            private_key: SecretString::from(FAKE_KEY.to_string()),
+        };
+        let dbg = format!("{cfg:?}");
+        assert!(!dbg.contains(FAKE_KEY), "Debug output must not contain key: {dbg}");
+        assert!(dbg.to_lowercase().contains("redacted"), "Debug should show REDACTED: {dbg}");
+    }
+
+    #[test]
+    fn deserializes_from_toml_string() {
+        let toml_src = format!(
+            r#"
+            network = "testnet"
+            private_key = "{FAKE_KEY}"
+        "#
+        );
+        let cfg: BulletConfig = toml::from_str(&toml_src).expect("parse");
+        assert_eq!(cfg.private_key.expose_secret(), FAKE_KEY);
+        assert!(cfg.key_file.is_none());
+    }
+
+    #[test]
+    fn deserializes_key_file_path() {
+        let toml_src = r#"
+            network = "testnet"
+            key_file = "/tmp/my-key"
+        "#;
+        let cfg: BulletConfig = toml::from_str(toml_src).expect("parse");
+        assert_eq!(cfg.key_file.as_deref(), Some(std::path::Path::new("/tmp/my-key")));
+        assert_eq!(cfg.private_key.expose_secret(), "");
+    }
+
+    #[test]
+    fn missing_key_defaults_to_empty() {
+        let cfg: BulletConfig = toml::from_str(r#"network = "testnet""#).expect("parse");
+        assert_eq!(cfg.private_key.expose_secret(), "");
+        assert!(cfg.key_file.is_none());
+    }
+}

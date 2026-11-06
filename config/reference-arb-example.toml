@@ -1,0 +1,48 @@
+# Single-instrument lead–lag: Binance USDⓈ-M LITUSDT → Bullet LIT-USD.
+[engine]
+# Watchdog between messages. Price-driven entries/exits run on every quote.
+tick_interval_ms = 1000
+status_bind = "127.0.0.1:3032"
+
+[recording]
+output_dir = "data/market"
+max_bytes = 20_000_000_000
+
+[exchanges.bullet]
+type = "bullet"
+network = "mainnet"
+key_file = "/home/ubuntu/.config/bullet/delegate.key"
+
+[strategy]
+type = "reference-arb"
+
+[strategy.reference-arb]
+exchange = "bullet"
+symbol = "LIT-USD"
+binance_symbol = "litusdt"
+binance_market = "perp"
+# Per-entry budget; quantity is rounded down to Bullet's LOT_SIZE step.
+order_notional = "100"
+basis_half_life_secs = 300.0
+entry_threshold_bps = 2.0
+# B: reserve below/above signal-time fair; this is an example, not a fitted value.
+entry_reserve_bps = 1.0
+# R is signed directly. Alternatively: { mode = "trailing", drawdown_bps = 2.0 }
+exit = { mode = "fair", remaining_bps = -1.5 }
+stop_loss_bps = 5.0
+# Net realized PnL drawdown from this run's peak. Omit to disable.
+max_drawdown_usd = "30"
+max_hold_secs = 60
+# Only Binance has an age limit; Bullet needs a new BBO after reconnect.
+reference_stale_ms = 1000
+# Existing Bullet market order = protected IOC. Only exits use this tolerance.
+market_slippage_bps = "50"
+dry_run = false
+
+# Omit this table to turn the impulse filter OFF.
+[strategy.reference-arb.impulse]
+window_ms = 250
+threshold_bps = 1.0
+
+[logging]
+level = "info"

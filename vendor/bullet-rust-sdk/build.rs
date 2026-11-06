@@ -1,0 +1,260 @@
+use std::env;
+use std::path::PathBuf;
+
+use schemars::schema::{InstanceType, SchemaObject};
+use serde_json::Value;
+
+use codegen::merge_response_arms;
+
+mod codegen;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("cargo:rerun-if-changed=openapi.json");
+    println!("cargo:rerun-if-env-changed=BULLET_REFRESH_SPEC");
+
+    // Read the committed openapi.json by default — no network access required.
+    // `BULLET_REFRESH_SPEC=1` fetches the live spec instead (`just refresh-spec`).
+    let spec_json = if std::env::var("BULLET_REFRESH_SPEC").is_ok() {
+        fetch_spec().ok_or("BULLET_REFRESH_SPEC set but live fetch failed")?
+    } else {
+        include_str!("openapi.json").to_string()
+    };
+
+    // Parse and apply workarounds
+    let mut spec: Value = serde_json::from_str(&spec_json)?;
+
+    // Convert OpenAPI 3.1 to 3.0 format
+    // Change version from 3.1.0 to 3.0.0
+    if let Some(openapi) = spec.get_mut("openapi") {
+        *openapi = Value::String("3.0.0".to_string());
+    }
+    convert_nullable_types(&mut spec);
+    fix_tuple_schemas(&mut spec);
+
+    // Generate client code using progenitor
+    let mut settings = progenitor::GenerationSettings::default();
+    settings.with_conversion(
+        SchemaObject {
+            instance_type: Some(InstanceType::String.into()),
+            format: Some("decimal".to_string()),
+            ..Default::default()
+        },
+        "rust_decimal::Decimal",
+        [progenitor::TypeImpl::Display, progenitor::TypeImpl::FromStr].into_iter(),
+    );
+    let mut generator = progenitor::Generator::new(&settings);
+
+    // Make progenitor generate `Error<types::ApiErrorResponse>`; a no-op for current specs.
+    ensure_error_responses(&mut spec);
+
+    let spec: openapiv3::OpenAPI = serde_json::from_value(spec.clone()).map_err(|e| {
+        // Save the problematic spec for debugging
+        let _ = std::fs::write(
+            "openapi-debug.json",
+            serde_json::to_string_pretty(&spec).unwrap(),
+        );
+        format!("Failed to parse OpenAPI spec: {e}. Saved debug output to openapi-debug.json")
+    })?;
+    let tokens = generator.generate_tokens(&spec)?;
+    let mut ast = syn::parse2(tokens)?;
+    merge_response_arms(&mut ast);
+    let content = prettyplease::unparse(&ast);
+
+    let out_path = PathBuf::from(env::var("OUT_DIR").unwrap()).join("codegen.rs");
+    std::fs::write(&out_path, &content)?;
+
+    // Expose the codegen path to downstream crates via `links` metadata.
+    // Downstream build scripts receive this as DEP_BULLET_RUST_CODEGEN_CODEGEN_PATH.
+    println!("cargo:codegen_path={}", out_path.display());
+    Ok(())
+}
+
+/// Fix OpenAPI 3.1 tuple schemas (items: false + prefixItems)
+/// Convert to OpenAPI 3.0 format by removing prefixItems and setting items to the first type
+fn fix_tuple_schemas(v: &mut Value) {
+    match v {
+        Value::Object(map) => {
+            // Check for tuple schema pattern: items: false + prefixItems
+            if let Some(Value::Bool(false)) = map.get("items")
+                && let Some(_prefix_items) = map.remove("prefixItems")
+            {
+                // For simplicity, use the first item type or make it generic
+                // Since both elements are strings in our case, we can use string
+                map.insert("items".to_string(), serde_json::json!({"type": "string"}));
+            }
+
+            // Recurse into all values
+            for val in map.values_mut() {
+                fix_tuple_schemas(val);
+            }
+        }
+        Value::Array(arr) => {
+            for val in arr.iter_mut() {
+                fix_tuple_schemas(val);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Convert OpenAPI 3.1 nullable types to 3.0 format
+/// OpenAPI 3.1 uses `type: ["string", "null"]` while 3.0 uses `type: "string", nullable: true`
+fn convert_nullable_types(v: &mut Value) {
+    match v {
+        Value::Object(map) => {
+            // Check if this is a type field with an array value
+            if let Some(Value::Array(types)) = map.get_mut("type") {
+                // Check if the array contains "null"
+                if types.len() == 2 {
+                    let has_null = types.iter().any(|t| t.as_str() == Some("null"));
+                    if has_null {
+                        // Find the non-null type
+                        let actual_type =
+                            types.iter().find(|t| t.as_str() != Some("null")).cloned();
+
+                        if let Some(t) = actual_type {
+                            // Replace array with single type and add nullable
+                            map.insert("type".to_string(), t);
+                            map.insert("nullable".to_string(), Value::Bool(true));
+                        }
+                    }
+                }
+            }
+            // Check if this is a type field with a oneOf null value
+            if let Some(Value::Array(types)) = map.get_mut("oneOf") {
+                let has_null = types
+                    .iter_mut()
+                    .any(|t| t.get("type").and_then(|x| x.as_str()) == Some("null"));
+                if has_null {
+                    types.retain(|t| t.get("type").and_then(|x| x.as_str()) != Some("null"));
+                    map.insert("nullable".to_string(), Value::Bool(true));
+                }
+            }
+
+            // Recurse into all values
+            for val in map.values_mut() {
+                convert_nullable_types(val);
+            }
+        }
+        Value::Array(arr) => {
+            for val in arr.iter_mut() {
+                convert_nullable_types(val);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Ensure all operations have error response definitions so progenitor generates
+/// `Error<types::ApiErrorResponse>` and auto-deserializes error bodies.
+///
+/// Fills in missing error responses; injects the schema too for older specs that lack it.
+///
+/// Note: `default` responses can't be used because progenitor treats `default` as both
+/// success and error, causing `assert!(response_types.len() <= 1)` in progenitor-impl.
+fn ensure_error_responses(spec: &mut Value) {
+    // 1. Ensure ApiErrorResponse exists in components/schemas
+    let has_schema = spec
+        .get("components")
+        .and_then(|c| c.get("schemas"))
+        .and_then(|s| s.get("ApiErrorResponse"))
+        .is_some();
+
+    if !has_schema {
+        let error_schema = serde_json::json!({
+            "type": "object",
+            "required": ["status", "message"],
+            "properties": {
+                "status": {
+                    "type": "integer",
+                    "format": "uint16",
+                    "description": "HTTP status code"
+                },
+                "message": {
+                    "type": "string",
+                    "description": "Human-readable error message"
+                },
+                "details": {
+                    "description": "Optional structured error details",
+                    "nullable": true
+                }
+            }
+        });
+
+        if let Some(components) = spec.get_mut("components").and_then(|c| c.as_object_mut())
+            && let Some(schemas) = components
+                .get_mut("schemas")
+                .and_then(|s| s.as_object_mut())
+        {
+            schemas.insert("ApiErrorResponse".to_string(), error_schema);
+        }
+    }
+
+    // 2. For operations missing error responses, add 4XX/5XX with ApiErrorResponse. Strip any
+    //    non-200 responses that don't reference ApiErrorResponse (e.g. old 501/503 stubs without a
+    //    body schema) to avoid confusing progenitor.
+    let error_response = serde_json::json!({
+        "description": "Error response",
+        "content": {
+            "application/json": {
+                "schema": {
+                    "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+            }
+        }
+    });
+
+    if let Some(paths) = spec.get_mut("paths").and_then(|p| p.as_object_mut()) {
+        for path_item in paths.values_mut() {
+            if let Some(path_obj) = path_item.as_object_mut() {
+                for operation in path_obj.values_mut() {
+                    if let Some(operation_obj) = operation.as_object_mut()
+                        && let Some(responses) = operation_obj
+                            .get_mut("responses")
+                            .and_then(|r| r.as_object_mut())
+                    {
+                        // Check if this operation already has error responses referencing
+                        // ApiErrorResponse via $ref (i.e., from the updated trading API spec).
+                        let has_error_responses = responses.iter().any(|(code, resp)| {
+                            code != "200"
+                                && resp
+                                    .pointer("/content/application~1json/schema/$ref")
+                                    .and_then(|v| v.as_str())
+                                    .is_some_and(|r| r.ends_with("/ApiErrorResponse"))
+                        });
+
+                        if !has_error_responses {
+                            // Old-style spec: strip non-200 stubs and inject 4XX/5XX
+                            responses.retain(|status_code, _| status_code == "200");
+                            responses.insert("4XX".to_string(), error_response.clone());
+                            responses.insert("5XX".to_string(), error_response.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn fetch_spec() -> Option<String> {
+    println!("cargo:rerun-if-env-changed=BULLET_API_ENDPOINT");
+    let endpoint = std::env::var("BULLET_API_ENDPOINT")
+        .unwrap_or_else(|_| "https://tradingapi.bullet.xyz".to_string());
+    let url = endpoint + "/docs/rest/openapi.json";
+    let response = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .ok()?
+        .get(&url)
+        .send()
+        .ok()?;
+    if response.status().is_success() {
+        return response.text().ok();
+    } else {
+        println!(
+            "cargo::warning=Spec fetch at '{url}' failed with: {}",
+            response.status()
+        );
+    }
+    None
+}

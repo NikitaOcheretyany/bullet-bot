@@ -1,0 +1,22 @@
+[package]
+name = "bb-strategy-avellaneda-stoikov"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Avellaneda-Stoikov market-making strategy for bullet-bots"
+
+[lints]
+workspace = true
+
+[dependencies]
+bb-core = { workspace = true }
+bb-exchange-binance = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rust_decimal = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+
+[lib]
+doctest = false

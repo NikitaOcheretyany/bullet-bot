@@ -1,0 +1,664 @@
+//! WebSocket message models for the Trading SDK.
+//!
+//! Re-exports `bullet-ws-interface` server messages and wraps them in the `TaggedMessage` /
+//! `ServerMessage` enums. New server message types must be added to `ServerMessage` by hand.
+
+pub use bullet_ws_interface::{
+    ListSubscriptionsMessage, MethodResult, OrderResultMessage, OrderResultPayload, TxStatus,
+};
+use serde::{Deserialize, Serialize};
+
+use crate::types::{
+    AggTradeMessage, BookTickerMessage, DepthUpdate, ErrorMessage, ForceOrderMessage,
+    MarkPriceMessage, MessageType, OrderUpdateMessage, PongMessage, RequestId, StatusMessage,
+};
+
+/// Event type of a market status message.
+///
+/// A unit enum rather than a `String` so that untagged deserialization of
+/// [`ServerMessage`] cannot accept a message that merely happens to carry the
+/// same field names with a different `e`.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarketStatusEventType {
+    #[serde(rename = "marketStatusUpdate")]
+    MarketStatusUpdate,
+}
+
+/// One market in a [`MarketStatusMessage`].
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct MarketStatusEntry {
+    /// Symbol.
+    #[serde(rename = "s")]
+    pub symbol: String,
+    /// Market id.
+    #[serde(rename = "i")]
+    pub market_id: u16,
+    /// Status, in the vocabulary of `GET /fapi/v1/exchangeInfo`'s `status`
+    /// field: `TRADING`, `POST_ONLY`, `CANCEL_ONLY`, `HALT` or `CLOSE`. Left
+    /// as a string so a status added server-side does not fail the whole
+    /// message; an unrecognized status should be treated as not tradable.
+    #[serde(rename = "st")]
+    pub status: String,
+    /// Status before this change; only set when `change` is `status`.
+    #[serde(rename = "ps", skip_serializing_if = "Option::is_none")]
+    pub previous_status: Option<String>,
+    /// What changed: `listed`, `status` or `delisted`. Absent in snapshots,
+    /// where every market is simply reported as-is.
+    #[serde(rename = "ch", skip_serializing_if = "Option::is_none")]
+    pub change: Option<String>,
+}
+
+/// Market status feed (`!marketStatus@arr`): a full snapshot on subscribe,
+/// deltas afterwards. The deltas are idempotent set-operations, so replaying
+/// one is harmless.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct MarketStatusMessage {
+    /// Event type.
+    #[serde(rename = "e")]
+    pub event_type: MarketStatusEventType,
+    /// Event time (us).
+    #[serde(rename = "E")]
+    pub event_time: u64,
+    /// Snapshot (every market) or update (only the changed ones).
+    #[serde(rename = "mt")]
+    pub msg_type: MessageType,
+    /// The markets reported in this message.
+    #[serde(rename = "m")]
+    pub markets: Vec<MarketStatusEntry>,
+}
+
+/// Tagged messages from the server (have an "e" event type field)
+#[derive(Serialize, Deserialize, Clone, Debug, strum::AsRefStr)]
+#[strum(serialize_all = "camelCase")]
+#[serde(tag = "e", rename_all = "snake_case")]
+pub enum TaggedMessage {
+    Status(StatusMessage),
+    Pong(PongMessage),
+    Error(ErrorMessage),
+    Subscribe(MethodResult),
+    Unsubscribe(MethodResult),
+    ListSubscriptions(ListSubscriptionsMessage),
+    // Order RPC `e` tags are dotted, not snake_case; aliases accept the spec's case-insensitive
+    // `ORDER.PLACE` form, as client.rs does.
+    #[serde(rename = "order.place", alias = "ORDER.PLACE")]
+    OrderPlace(OrderResultMessage),
+    #[serde(rename = "order.cancel", alias = "ORDER.CANCEL")]
+    OrderCancel(OrderResultMessage),
+    #[serde(
+        rename = "order.amend",
+        alias = "ORDER.AMEND",
+        alias = "order.modify",
+        alias = "ORDER.MODIFY"
+    )]
+    OrderAmend(OrderResultMessage),
+    #[serde(rename = "order.cancelAll", alias = "ORDER.CANCEL_ALL")]
+    OrderCancelAll(OrderResultMessage),
+}
+
+/// All possible server messages.
+///
+/// Untagged: serde tries variants in order; `Unknown` catches anything unmatched.
+#[derive(Serialize, Deserialize, Clone, Debug, strum::AsRefStr)]
+#[strum(serialize_all = "camelCase")]
+#[serde(untagged)]
+pub enum ServerMessage {
+    // Tagged messages with "e" field - try these first
+    Tagged(TaggedMessage),
+
+    // Binance-style messages (identified by "e" event type field)
+    DepthUpdate(DepthUpdate),
+    AggTrade(AggTradeMessage),
+    BookTicker(BookTickerMessage),
+    MarkPrice(MarkPriceMessage),
+    ForceOrder(ForceOrderMessage),
+    OrderUpdate(OrderUpdateMessage),
+    MarketStatus(MarketStatusMessage),
+
+    // Untagged error response (e.g., order errors without "e" field)
+    Error(ErrorMessage),
+
+    /// Failed to parse message - contains (error message, raw text)
+    #[serde(skip)]
+    Unknown(String, String),
+}
+
+impl ServerMessage {
+    /// Returns true if this is an error message
+    pub fn is_error(&self) -> bool {
+        matches!(
+            self,
+            ServerMessage::Tagged(TaggedMessage::Error(_)) | ServerMessage::Error(_)
+        )
+    }
+
+    /// Returns the request ID if present
+    pub fn request_id(&self) -> Option<RequestId> {
+        match self {
+            ServerMessage::Tagged(msg) => match msg {
+                TaggedMessage::Pong(m) => m.id,
+                TaggedMessage::Error(m) => m.id,
+                TaggedMessage::Subscribe(m) | TaggedMessage::Unsubscribe(m) => m.id,
+                TaggedMessage::ListSubscriptions(m) => m.id,
+                TaggedMessage::OrderPlace(m)
+                | TaggedMessage::OrderCancel(m)
+                | TaggedMessage::OrderAmend(m)
+                | TaggedMessage::OrderCancelAll(m) => m.id,
+                _ => None,
+            },
+            ServerMessage::Error(m) => m.id,
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn market_status_snapshot_and_update_parse() {
+        let snapshot = r#"{
+            "e": "marketStatusUpdate",
+            "E": 1706745600000000,
+            "mt": "s",
+            "m": [{"s": "BTC-USD", "i": 1, "st": "TRADING"}]
+        }"#;
+        let msg: ServerMessage = serde_json::from_str(snapshot).unwrap();
+        let ServerMessage::MarketStatus(status) = msg else {
+            panic!("expected a market status message, got {msg:?}");
+        };
+        assert!(matches!(status.msg_type, MessageType::Snapshot));
+        assert_eq!(status.markets[0].symbol, "BTC-USD");
+        assert_eq!(status.markets[0].market_id, 1);
+        assert_eq!(status.markets[0].status, "TRADING");
+        assert!(status.markets[0].change.is_none());
+
+        let update = r#"{
+            "e": "marketStatusUpdate",
+            "E": 1706745600000000,
+            "mt": "u",
+            "m": [
+                {"s": "BTC-USD", "i": 1, "st": "HALT", "ps": "TRADING", "ch": "status"},
+                {"s": "SOL-USD", "i": 3, "st": "POST_ONLY", "ch": "listed"}
+            ]
+        }"#;
+        let msg: ServerMessage = serde_json::from_str(update).unwrap();
+        let ServerMessage::MarketStatus(status) = msg else {
+            panic!("expected a market status message, got {msg:?}");
+        };
+        assert!(matches!(status.msg_type, MessageType::Update));
+        assert_eq!(
+            status.markets[0].previous_status.as_deref(),
+            Some("TRADING")
+        );
+        assert_eq!(status.markets[0].change.as_deref(), Some("status"));
+        assert_eq!(status.markets[1].change.as_deref(), Some("listed"));
+    }
+
+    /// The `e` tag is a unit enum, so a message carrying the same field names
+    /// under a different event type must not be accepted as a market status.
+    #[test]
+    fn a_foreign_event_type_is_not_a_market_status() {
+        let json = r#"{
+            "e": "somethingElse",
+            "E": 1706745600000000,
+            "mt": "s",
+            "m": [{"s": "BTC-USD", "i": 1, "st": "TRADING"}]
+        }"#;
+        let msg: Result<ServerMessage, _> = serde_json::from_str(json);
+        assert!(
+            !matches!(msg, Ok(ServerMessage::MarketStatus(_))),
+            "foreign event type parsed as a market status"
+        );
+    }
+
+    #[test]
+    fn test_depth_update() {
+        let json = r#"{
+            "e": "depthUpdate",
+            "E": 1234567890,
+            "T": 1234567890,
+            "s": "BTCUSDT",
+            "U": 100,
+            "u": 200,
+            "pu": 99,
+            "b": [["50000.00", "1.5"]],
+            "a": [["50001.00", "2.0"]],
+            "mt": "s"
+        }"#;
+
+        let msg: ServerMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(msg, ServerMessage::DepthUpdate(_)));
+
+        if let ServerMessage::DepthUpdate(d) = msg {
+            assert_eq!(d.symbol, "BTCUSDT");
+            assert_eq!(d.bids.len(), 1);
+            assert_eq!(d.asks.len(), 1);
+        }
+    }
+
+    #[test]
+    fn test_agg_trade() {
+        let json = r#"{
+            "e": "aggTrade",
+            "E": 1234567890,
+            "s": "BTCUSDT",
+            "a": 12345,
+            "p": "50000.00",
+            "q": "1.5",
+            "f": 100,
+            "l": 105,
+            "T": 1234567890,
+            "m": true,
+            "th": "0xabc123",
+            "ua": "0xdef456",
+            "oi": 999,
+            "mk": true,
+            "ff": false,
+            "lq": false,
+            "fe": "0.001",
+            "nf": "0.001",
+            "fa": "USDT",
+            "sd": "BUY"
+        }"#;
+
+        let msg: ServerMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(msg, ServerMessage::AggTrade(_)));
+
+        if let ServerMessage::AggTrade(t) = msg {
+            assert_eq!(t.symbol, "BTCUSDT");
+            assert_eq!(t.price, "50000.00");
+            assert!(t.is_buyer_maker);
+        }
+    }
+
+    #[test]
+    fn test_book_ticker() {
+        let json = r#"{
+            "e": "bookTicker",
+            "u": 12345,
+            "E": 1234567890,
+            "T": 1234567890,
+            "s": "ETHUSDT",
+            "b": "3000.00",
+            "B": "10.5",
+            "a": "3001.00",
+            "A": "8.2",
+            "mt": "u"
+        }"#;
+
+        let msg: ServerMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(msg, ServerMessage::BookTicker(_)));
+
+        if let ServerMessage::BookTicker(b) = msg {
+            assert_eq!(b.symbol, "ETHUSDT");
+            assert_eq!(b.best_bid_price, "3000.00");
+            assert_eq!(b.best_ask_price, "3001.00");
+        }
+    }
+
+    #[test]
+    fn test_mark_price() {
+        let json = r#"{
+            "e": "markPriceUpdate",
+            "E": 1234567890,
+            "s": "BTCUSDT",
+            "p": "50000.00",
+            "i": "49999.00",
+            "r": "0.0001"
+        }"#;
+
+        let msg: ServerMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(msg, ServerMessage::MarkPrice(_)));
+
+        if let ServerMessage::MarkPrice(m) = msg {
+            assert_eq!(m.symbol, "BTCUSDT");
+            assert_eq!(m.mark_price, "50000.00");
+            assert_eq!(m.funding_rate, "0.0001");
+        }
+    }
+
+    #[test]
+    fn test_force_order() {
+        let json = r#"{
+            "e": "liquidation",
+            "E": 1234567890,
+            "o": {
+                "s": "BTCUSDT",
+                "S": "SELL",
+                "o": "LIMIT",
+                "f": "IOC",
+                "p": "49000.00",
+                "ap": "49000.00",
+                "X": "FILLED",
+                "l": "1.0",
+                "T": 1234567890,
+                "th": "0xabc",
+                "ua": "0xdef",
+                "oi": 123,
+                "ti": 456
+            }
+        }"#;
+
+        let msg: ServerMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(msg, ServerMessage::ForceOrder(_)));
+
+        if let ServerMessage::ForceOrder(f) = msg {
+            assert_eq!(f.order.symbol, "BTCUSDT");
+            assert_eq!(f.order.side, "SELL");
+        }
+    }
+
+    #[test]
+    fn test_order_update() {
+        let json = r#"{
+            "e": "orderTradeUpdate",
+            "E": 1234567890,
+            "o": {
+                "s": "BTCUSDT",
+                "i": 12345,
+                "X": "NEW",
+                "x": "NEW",
+                "T": 1234567890,
+                "th": "0xabc",
+                "ua": "0xdef",
+                "S": "BUY",
+                "o": "LIMIT",
+                "f": "GTC",
+                "p": "50000.00",
+                "q": "1.0"
+            }
+        }"#;
+
+        let msg: ServerMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(msg, ServerMessage::OrderUpdate(_)));
+
+        if let ServerMessage::OrderUpdate(o) = msg {
+            assert_eq!(o.event_time, 1234567890);
+        }
+    }
+
+    #[test]
+    fn test_status_message() {
+        let json = r#"{
+            "e": "status",
+            "E": 1234567890,
+            "status": "connected",
+            "clientId": "client-123"
+        }"#;
+
+        let msg: ServerMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            msg,
+            ServerMessage::Tagged(TaggedMessage::Status(_))
+        ));
+
+        if let ServerMessage::Tagged(TaggedMessage::Status(s)) = msg {
+            assert_eq!(s.status, "connected");
+            assert_eq!(s.client_id, "client-123");
+            assert_eq!(s.event_time, 1234567890);
+        }
+    }
+
+    #[test]
+    fn test_pong_message() {
+        let json = r#"{
+            "e": "pong",
+            "id": 42,
+            "E": 1234567890
+        }"#;
+
+        let msg: ServerMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(msg, ServerMessage::Tagged(TaggedMessage::Pong(_))));
+        assert_eq!(msg.request_id(), Some(RequestId::from(42)));
+    }
+
+    #[test]
+    fn test_error_message() {
+        let json = r#"{
+            "e": "error",
+            "id": 1,
+            "E": 1234567890,
+            "error": {
+                "code": -1004,
+                "msg": "Invalid subscription format"
+            }
+        }"#;
+
+        let msg: ServerMessage = serde_json::from_str(json).unwrap();
+        assert!(msg.is_error(), "Expected error message, got: {msg:?}");
+        assert_eq!(msg.request_id(), Some(RequestId::from(1)));
+    }
+
+    #[test]
+    fn test_order_error() {
+        // Order errors come without the "e" tag
+        let json = r#"{
+            "id": 2,
+            "E": 1234567890,
+            "error": {
+                "code": -2010,
+                "msg": "Transaction execution unsuccessful"
+            }
+        }"#;
+
+        let msg: ServerMessage = serde_json::from_str(json).unwrap();
+        assert!(msg.is_error(), "Expected error message, got: {msg:?}");
+        assert_eq!(msg.request_id(), Some(RequestId::from(2)));
+        assert!(matches!(msg, ServerMessage::Error(_)));
+    }
+
+    #[test]
+    fn test_subscribe_success() {
+        let json = r#"{
+            "e": "subscribe",
+            "id": 5,
+            "E": 1234567890,
+            "result": "success"
+        }"#;
+
+        let msg: ServerMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            msg,
+            ServerMessage::Tagged(TaggedMessage::Subscribe(_))
+        ));
+        assert_eq!(msg.request_id(), Some(RequestId::from(5)));
+
+        if let ServerMessage::Tagged(TaggedMessage::Subscribe(s)) = msg {
+            assert_eq!(s.result, "success");
+        }
+    }
+
+    #[test]
+    fn test_unsubscribe_success() {
+        let json = r#"{
+            "e": "unsubscribe",
+            "id": 6,
+            "E": 1234567890,
+            "result": "success"
+        }"#;
+
+        let msg: ServerMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            msg,
+            ServerMessage::Tagged(TaggedMessage::Unsubscribe(_))
+        ));
+        assert_eq!(msg.request_id(), Some(RequestId::from(6)));
+    }
+
+    #[test]
+    fn test_list_subscriptions() {
+        let json = r#"{
+            "e": "list_subscriptions",
+            "id": 7,
+            "E": 1234567890,
+            "result": ["btcusdt@depth10", "ethusdt@aggTrade"]
+        }"#;
+
+        let msg: ServerMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            msg,
+            ServerMessage::Tagged(TaggedMessage::ListSubscriptions(_))
+        ));
+
+        if let ServerMessage::Tagged(TaggedMessage::ListSubscriptions(l)) = msg {
+            assert_eq!(l.result.len(), 2);
+            assert_eq!(l.result[0], "btcusdt@depth10");
+        }
+    }
+
+    #[test]
+    fn test_order_place_result() {
+        let json = r#"{
+            "e": "order.place",
+            "id": 10,
+            "E": 1706745600000000,
+            "results": {
+                "tx_id": "0xabc",
+                "status": "processed",
+                "order_ids": [1, 2],
+                "client_order_ids": [100, 101]
+            }
+        }"#;
+
+        let msg: ServerMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            msg,
+            ServerMessage::Tagged(TaggedMessage::OrderPlace(_))
+        ));
+        assert_eq!(msg.request_id(), Some(RequestId::from(10)));
+        if let ServerMessage::Tagged(TaggedMessage::OrderPlace(r)) = msg {
+            assert_eq!(r.results.tx_id, "0xabc");
+            assert_eq!(r.results.status, TxStatus::Processed);
+            assert_eq!(r.results.order_ids, vec![1, 2]);
+            assert_eq!(r.results.client_order_ids, vec![100, 101]);
+        }
+    }
+
+    #[test]
+    fn test_order_amend_with_alias() {
+        // The spec accepts `order.amend`, `order.modify`, and `ORDER.AMEND`.
+        for tag in ["order.amend", "order.modify"] {
+            let json = format!(
+                r#"{{"e":"{tag}","id":11,"E":1706745600000000,
+                   "results":{{"tx_id":"0xdef","status":"published"}}}}"#
+            );
+            let msg: ServerMessage = serde_json::from_str(&json).unwrap();
+            assert!(
+                matches!(msg, ServerMessage::Tagged(TaggedMessage::OrderAmend(_))),
+                "tag={tag}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_order_cancel_all_result() {
+        let json = r#"{
+            "e": "order.cancelAll",
+            "id": 12,
+            "E": 1706745600000000,
+            "results": {
+                "tx_id": "0xghi",
+                "status": "processed",
+                "order_ids": [1, 2, 3]
+            }
+        }"#;
+
+        let msg: ServerMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            msg,
+            ServerMessage::Tagged(TaggedMessage::OrderCancelAll(_))
+        ));
+        assert_eq!(msg.request_id(), Some(RequestId::from(12)));
+        if let ServerMessage::Tagged(TaggedMessage::OrderCancelAll(r)) = msg {
+            assert_eq!(r.results.order_ids.len(), 3);
+            // client_order_ids is optional — absent in payload means empty Vec.
+            assert!(r.results.client_order_ids.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_order_cancel_result() {
+        let json = r#"{
+            "e": "order.cancel",
+            "id": 20,
+            "E": 1706745600000000,
+            "results": {
+                "tx_id": "0xcancel",
+                "status": "processed",
+                "order_ids": [5],
+                "client_order_ids": [50]
+            }
+        }"#;
+        let msg: ServerMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            msg,
+            ServerMessage::Tagged(TaggedMessage::OrderCancel(_))
+        ));
+        assert_eq!(msg.request_id(), Some(RequestId::from(20)));
+    }
+
+    #[test]
+    fn test_screaming_snake_aliases() {
+        // Each SCREAMING alias must map to the specific expected variant, not just any order
+        // variant.
+        let cases: &[(&str, &str)] = &[
+            ("ORDER.PLACE", "OrderPlace"),
+            ("ORDER.CANCEL", "OrderCancel"),
+            ("ORDER.AMEND", "OrderAmend"),
+            ("ORDER.MODIFY", "OrderAmend"),
+            ("ORDER.CANCEL_ALL", "OrderCancelAll"),
+        ];
+        for (tag, expected) in cases {
+            let json = format!(
+                r#"{{"e":"{tag}","id":1,"E":1706745600000000,"results":{{"tx_id":"0x1","status":"processed"}}}}"#
+            );
+            let msg: ServerMessage = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("failed to parse '{tag}': {e}"));
+            let ServerMessage::Tagged(ref inner) = msg else {
+                panic!("'{tag}' did not parse as Tagged");
+            };
+            let actual = match inner {
+                TaggedMessage::OrderPlace(_) => "OrderPlace",
+                TaggedMessage::OrderCancel(_) => "OrderCancel",
+                TaggedMessage::OrderAmend(_) => "OrderAmend",
+                TaggedMessage::OrderCancelAll(_) => "OrderCancelAll",
+                other => panic!("'{tag}' mapped to unexpected variant: {}", other.as_ref()),
+            };
+            assert_eq!(actual, *expected, "'{tag}' mapped to wrong variant");
+        }
+    }
+
+    #[test]
+    fn test_order_result_id_absent() {
+        // Server may omit `id` on unsolicited pushes; request_id() must return None.
+        let json = r#"{"e":"order.place","E":1706745600000000,"results":{"tx_id":"0x1","status":"processed"}}"#;
+        let msg: ServerMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            msg,
+            ServerMessage::Tagged(TaggedMessage::OrderPlace(_))
+        ));
+        assert_eq!(msg.request_id(), None);
+    }
+
+    #[test]
+    fn test_tx_status_is_success() {
+        assert!(TxStatus::Processed.is_success());
+        assert!(TxStatus::Published.is_success());
+        assert!(TxStatus::Submitted.is_success());
+        assert!(TxStatus::Finalized.is_success());
+        assert!(!TxStatus::Dropped.is_success());
+        assert!(!TxStatus::Unknown.is_success());
+    }
+
+    #[test]
+    fn test_order_result_does_not_steal_other_tagged() {
+        // Status messages must NOT be misclassified as an order result.
+        let json = r#"{"e":"status","E":1234567890,"status":"connected","clientId":"x"}"#;
+        let msg: ServerMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            msg,
+            ServerMessage::Tagged(TaggedMessage::Status(_))
+        ));
+    }
+}

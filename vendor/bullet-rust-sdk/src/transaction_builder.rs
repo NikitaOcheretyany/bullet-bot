@@ -1,0 +1,1679 @@
+//! Versioned, chain-bound transaction building, signing and submission.
+
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use bon::bon;
+use borsh::{BorshDeserialize, BorshSerialize};
+use bullet_exchange_interface::address::Address;
+use bullet_exchange_interface::schema::Schema;
+use bullet_exchange_interface::transaction::{
+    Amount, Gas, PriorityFeeBips, RuntimeCall, Transaction as SignedTransaction,
+    TransactionSigningPayload, TxDetails, UniquenessData,
+    UnsignedTransaction as RawUnsignedTransaction, chain_hash_fragment,
+};
+use serde_json::Value;
+
+use crate::codegen::Error::ErrorResponse;
+use crate::generated::types::{
+    ApiErrorResponse, SubmitSolanaOffchainTxRequest, SubmitTxRequest, SubmitTxResponse,
+};
+use crate::types::{CallMessage, UserAction};
+use crate::{Client, Keypair, SDKError, SDKResult};
+
+const SIGNING_PAYLOAD_VERSION_V0: u8 = 0;
+
+/// An unsigned transaction with the chain hash baked in.
+///
+/// Created by [`UnsignedTransaction::build`]. Contains everything
+/// needed to produce signable bytes without a client reference.
+#[derive(Debug)]
+pub struct UnsignedTransaction {
+    pub(crate) inner: RawUnsignedTransaction,
+    pub(crate) chain_hash: [u8; 32],
+    pub(crate) chain_name: String,
+}
+
+#[bon]
+impl UnsignedTransaction {
+    /// Serialize into the bytes that must be signed.
+    ///
+    /// These are the Borsh bytes of the rollup's V0 signing payload: a version
+    /// byte (`0`), the unsigned transaction, and the chain hash (32 bytes) as a
+    /// domain separator.
+    pub fn to_bytes(&self) -> SDKResult<Vec<u8>> {
+        Ok(self.inner.signing_bytes(&self.chain_hash))
+    }
+
+    /// Reconstruct an [`UnsignedTransaction`] from the bytes produced by
+    /// [`to_bytes`](UnsignedTransaction::to_bytes).
+    ///
+    /// The embedded chain hash must match `client`'s, rejecting bytes built for another network.
+    /// The payload is read back verbatim, so persisted signable bytes rebuild byte-identically.
+    ///
+    /// Pre-fork bytes (`borsh(unsigned_tx) ++ chain_hash`, no version byte) are rejected with
+    /// [`SDKError::SerializationError`]; rebuild those from their inputs and re-sign.
+    pub fn from_bytes(bytes: &[u8], client: &Client) -> SDKResult<UnsignedTransaction> {
+        if bytes.first() != Some(&SIGNING_PAYLOAD_VERSION_V0) {
+            return Err(SDKError::SerializationError(format!(
+                "signable bytes must start with signing payload version byte \
+                 {SIGNING_PAYLOAD_VERSION_V0} (found {:?}); this SDK cannot rebuild them — \
+                 rebuild the transaction from its inputs and re-sign it",
+                bytes.first()
+            )));
+        }
+        let payload = match TransactionSigningPayload::from_signing_bytes(bytes)
+            .map_err(|e| SDKError::SerializationError(e.to_string()))?
+        {
+            TransactionSigningPayload::V0(payload) => payload,
+            #[allow(unreachable_patterns)]
+            other => {
+                return Err(SDKError::SerializationError(format!(
+                    "unsupported signing payload version: {other:?}"
+                )));
+            }
+        };
+        let chain_hash = payload.chain_hash;
+
+        if chain_hash != client.chain_hash() {
+            return Err(SDKError::InvalidChainHash(
+                "does not match the connected client (built for a different network?)".to_string(),
+            ));
+        }
+
+        Ok(UnsignedTransaction {
+            inner: payload.into_unsigned_transaction(),
+            chain_hash,
+            chain_name: client.chain_name(),
+        })
+    }
+
+    /// Render the unsigned transaction payload as a human-readable message.
+    ///
+    /// For external wallets that can only display raw message bytes. Display only; sign the bytes
+    /// from [`to_bytes`](UnsignedTransaction::to_bytes).
+    pub fn to_display_message(&self) -> SDKResult<String> {
+        let schema = Schema::of_single_type::<RawUnsignedTransaction>()
+            .map_err(|e| SDKError::SerializationError(e.to_string()))?;
+        let bytes =
+            borsh::to_vec(&self.inner).map_err(|e| SDKError::SerializationError(e.to_string()))?;
+        schema
+            .display(0, &bytes)
+            .map_err(|e| SDKError::SerializationError(e.to_string()))
+    }
+
+    /// Build the bytes a Ledger hardware wallet must sign.
+    ///
+    /// Prepends the 85-byte Solana off-chain message preamble (with `chain_hash` as the application
+    /// domain) to the JSON message, as Ledger firmware requires. Sign with `wallet.signMessage`,
+    /// then assemble with [`SolanaLedgerTransaction::from_parts`] and submit with
+    /// [`Client::send_ledger_transaction`].
+    pub fn to_ledger_signable_bytes(&self, pubkey: &[u8; 32]) -> SDKResult<Vec<u8>> {
+        let json_bytes = self.to_message_bytes()?;
+        let message_len = u16::try_from(json_bytes.len()).map_err(|_| {
+            SDKError::SerializationError(format!(
+                "JSON message too large for Solana preamble: {} bytes (max {})",
+                json_bytes.len(),
+                u16::MAX
+            ))
+        })?;
+        let mut result = make_solana_preamble(&[*pubkey], &self.chain_hash, message_len);
+        result.extend_from_slice(&json_bytes);
+        Ok(result)
+    }
+
+    /// Serialize into the human-readable JSON bytes for offchain signing.
+    ///
+    /// External Solana wallets sign this when the backend uses the `solanaSimple` authenticator.
+    /// Wrap the signature with [`SolanaOffchainTransaction::from_parts`] and submit via
+    /// [`Client::send_offchain_transaction`].
+    pub fn to_message_bytes(&self) -> SDKResult<Vec<u8>> {
+        let message = serde_json::to_value(&self.inner)?;
+
+        let Value::Object(mut message) = message else {
+            return Err(SDKError::SerializationError(
+                "unsigned transaction serialized to non-object JSON".to_string(),
+            ));
+        };
+        // The offchain authenticator expects `max_fee` (the only u128 detail) as a JSON string;
+        // other integers stay numbers.
+        stringify_offchain_max_fee(&mut message, self.inner.details.max_fee.0)?;
+        message.insert(
+            "chain_name".to_string(),
+            Value::String(self.chain_name.clone()),
+        );
+        // The single-signer Solana payload carries an explicit format version.
+        message.insert("version".to_string(), Value::from(0u8));
+        serde_json::to_vec(&Value::Object(message)).map_err(Into::into)
+    }
+
+    /// Build an unsigned transaction.
+    ///
+    /// The result embeds the chain hash, so [`to_bytes()`](UnsignedTransaction::to_bytes) needs no
+    /// client.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let unsigned = UnsignedTransaction::builder()
+    ///     .call_message(call_msg)
+    ///     .max_fee(10_000_000)
+    ///     .client(&client)
+    ///     .build()?;
+    ///
+    /// let signable = unsigned.to_bytes()?;
+    /// let signature: [u8; 64] = external_signer.sign(&signable);
+    /// let pub_key: [u8; 32] = external_signer.public_key();
+    /// let signed = Transaction::from_parts(unsigned, signature, pub_key);
+    /// ```
+    #[builder]
+    pub fn new(
+        call_message: CallMessage,
+        max_fee: u128,
+        priority_fee_bips: u64,
+        gas_limit: Option<Gas>,
+        /// Transaction uniqueness ([`UniquenessData::Nonce`],
+        /// [`UniquenessData::Generation`], or [`UniquenessData::Window`]).
+        ///
+        /// Defaults to [`UniquenessData::Window`] from a per-client millisecond counter: monotonic,
+        /// duplicate-free and needs no chain round-trip.
+        uniqueness: Option<UniquenessData>,
+        /// Account to execute as. `None` = the signer's default address; `Some` = another account
+        /// that authorised the signer's credential (e.g. a multisig or delegated account).
+        address_override: Option<Address>,
+        client: &Client,
+    ) -> SDKResult<UnsignedTransaction> {
+        Self::from_runtime_call(
+            RuntimeCall::Exchange(call_message),
+            max_fee,
+            priority_fee_bips,
+            gas_limit,
+            uniqueness,
+            address_override,
+            client,
+        )
+    }
+
+    /// Build an unsigned transaction from a whole [`RuntimeCall`].
+    ///
+    /// The primary constructor; [`builder`](UnsignedTransaction::builder) wraps a typed
+    /// [`CallMessage`] as `RuntimeCall::Exchange` and calls this. Use it for dynamically assembled
+    /// calls (e.g. a `RuntimeCall` deserialized from JSON). Exchange calls are validated against
+    /// the client's schema; other variants pass through. For `address_override` see
+    /// [`builder`](UnsignedTransaction::builder).
+    pub fn from_runtime_call(
+        runtime_call: RuntimeCall,
+        max_fee: u128,
+        priority_fee_bips: u64,
+        gas_limit: Option<Gas>,
+        uniqueness: Option<UniquenessData>,
+        address_override: Option<Address>,
+        client: &Client,
+    ) -> SDKResult<UnsignedTransaction> {
+        if let RuntimeCall::Exchange(ref call_message) = runtime_call
+            && !Client::call_message_was_validated(call_message, client.user_actions().as_deref())
+        {
+            return Err(SDKError::UnsupportedCallMessage(call_message.msg_type()));
+        }
+
+        let uniqueness =
+            uniqueness.unwrap_or_else(|| UniquenessData::Window(client.next_window_nonce()));
+        let chain_hash = client.chain_hash();
+        let details = TxDetails {
+            chain_hash_fragment: chain_hash_fragment(&chain_hash),
+            max_fee: Amount(max_fee),
+            gas_limit,
+            max_priority_fee_bips: PriorityFeeBips(priority_fee_bips),
+        };
+
+        Ok(UnsignedTransaction {
+            inner: RawUnsignedTransaction {
+                runtime_call,
+                uniqueness,
+                details,
+                address_override,
+            },
+            chain_hash,
+            chain_name: client.chain_name(),
+        })
+    }
+}
+
+// Solana off-chain signing domain: 0xff followed by "solana offchain" (15 bytes).
+const SOLANA_SIGNING_DOMAIN: [u8; 16] = *b"\xffsolana offchain";
+
+// Solana offchain preamble layout: domain[16], version[1], chain_hash[32], format[1],
+// signer_count[1], pubkeys[32 * N], message_length[2 LE].
+pub(crate) fn make_solana_preamble(
+    pubkeys: &[[u8; 32]],
+    chain_hash: &[u8; 32],
+    message_length: u16,
+) -> Vec<u8> {
+    let mut preamble = Vec::with_capacity(pubkeys.len().saturating_mul(32).saturating_add(53));
+    preamble.extend_from_slice(&SOLANA_SIGNING_DOMAIN);
+    preamble.push(0); // header_version
+    preamble.extend_from_slice(chain_hash);
+    preamble.push(0); // message_format
+    preamble.push(pubkeys.len() as u8); // signer_count
+    for pubkey in pubkeys {
+        preamble.extend_from_slice(pubkey);
+    }
+    preamble.extend_from_slice(&message_length.to_le_bytes());
+    preamble
+}
+
+/// A Solana offchain transaction ready for sequencer submission.
+///
+/// For external Solana wallets that display readable JSON instead of Borsh bytes. Sign
+/// [`UnsignedTransaction::to_message_bytes`], assemble with
+/// [`SolanaOffchainTransaction::from_parts`], then submit via
+/// [`Client::send_offchain_transaction`].
+#[derive(Clone, Debug, Eq, PartialEq, BorshDeserialize, BorshSerialize)]
+pub struct SolanaOffchainTransaction {
+    /// JSON message bytes signed by the Solana wallet.
+    pub signed_message: Vec<u8>,
+    /// Chain hash required by the current Solana offchain Borsh envelope.
+    pub chain_hash: [u8; 32],
+    /// Solana Ed25519 public key.
+    pub pubkey: [u8; 32],
+    /// Ed25519 signature over `signed_message`.
+    pub signature: [u8; 64],
+}
+
+impl SolanaOffchainTransaction {
+    /// Assemble a Solana offchain transaction from an unsigned transaction, a
+    /// 64-byte Ed25519 signature, and a 32-byte public key.
+    ///
+    /// Use after signing the bytes from
+    /// [`UnsignedTransaction::to_message_bytes`].
+    pub fn from_parts(
+        tx: UnsignedTransaction,
+        signature: [u8; 64],
+        pubkey: [u8; 32],
+    ) -> SDKResult<Self> {
+        Ok(Self {
+            signed_message: tx.to_message_bytes()?,
+            chain_hash: tx.chain_hash,
+            pubkey,
+            signature,
+        })
+    }
+
+    /// Borsh-serialize a Solana offchain transaction to bytes.
+    pub fn to_bytes(&self) -> SDKResult<Vec<u8>> {
+        borsh::to_vec(self).map_err(|e| SDKError::SerializationError(e.to_string()))
+    }
+
+    /// Borsh-serialize and base64-encode a Solana offchain transaction.
+    pub fn to_base64(&self) -> SDKResult<String> {
+        let bytes = self.to_bytes()?;
+        Ok(BASE64.encode(&bytes))
+    }
+}
+
+/// A Solana offchain transaction using the spec-compliant Ledger wire format.
+///
+/// Use this for Ledger hardware wallets. Sign the bytes from
+/// [`UnsignedTransaction::to_ledger_signable_bytes`], assemble with
+/// [`SolanaLedgerTransaction::from_parts`], then submit via
+/// [`Client::send_ledger_transaction`].
+///
+/// Wire format: `[u32 LE: message_len][preamble + json][64-byte sig]`, base64-
+/// encoded and posted as `{"body":"..."}`.
+#[derive(Clone, Debug)]
+pub struct SolanaLedgerTransaction {
+    /// Preamble (85 bytes) concatenated with JSON message bytes.
+    pub signed_message: Vec<u8>,
+    /// Ed25519 signature over `signed_message`.
+    pub signature: [u8; 64],
+}
+
+impl SolanaLedgerTransaction {
+    /// Assemble a Ledger transaction from an unsigned transaction, a 32-byte
+    /// public key, and a 64-byte Ed25519 signature.
+    ///
+    /// Use after signing [`UnsignedTransaction::to_ledger_signable_bytes`].
+    pub fn from_parts(
+        tx: UnsignedTransaction,
+        pubkey: [u8; 32],
+        signature: [u8; 64],
+    ) -> SDKResult<Self> {
+        Ok(Self {
+            signed_message: tx.to_ledger_signable_bytes(&pubkey)?,
+            signature,
+        })
+    }
+
+    /// Serialize to the raw binary wire format.
+    ///
+    /// Layout: `[u32 LE: message_len][signed_message][signature]`
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(self.signed_message.len().saturating_add(68));
+        buf.extend_from_slice(&(self.signed_message.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&self.signed_message);
+        buf.extend_from_slice(&self.signature);
+        buf
+    }
+
+    /// Serialize to wire format and base64-encode.
+    pub fn to_base64(&self) -> String {
+        BASE64.encode(self.to_bytes())
+    }
+}
+
+/// Transaction construction and serialization.
+///
+/// Use `Transaction::builder()` for signed transactions, or
+/// `UnsignedTransaction::builder()` for external signing.
+pub struct Transaction;
+
+#[bon]
+impl Transaction {
+    /// Build a signed transaction.
+    ///
+    /// Builds the unsigned transaction, signs it with the provided keypair and assembles the
+    /// result.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let signed = Transaction::builder()
+    ///     .call_message(call_msg)
+    ///     .max_fee(10_000_000)
+    ///     .signer(&keypair)
+    ///     .client(&client)
+    ///     .build()?;
+    ///
+    /// client.send_transaction(&signed).await?;
+    /// ```
+    #[builder]
+    pub fn new(
+        call_message: CallMessage,
+        max_fee: Option<u128>,
+        priority_fee_bips: Option<u64>,
+        gas_limit: Option<Gas>,
+        uniqueness: Option<UniquenessData>,
+        /// Account to execute as; see [`UnsignedTransaction::builder`].
+        address_override: Option<Address>,
+        signer: Option<&Keypair>,
+        client: &Client,
+    ) -> SDKResult<SignedTransaction> {
+        Self::from_runtime_call(
+            RuntimeCall::Exchange(call_message),
+            max_fee,
+            priority_fee_bips,
+            gas_limit,
+            uniqueness,
+            address_override,
+            signer,
+            client,
+        )
+    }
+
+    /// Build and sign a transaction from a whole [`RuntimeCall`].
+    ///
+    /// Builds the unsigned transaction, signs `to_bytes()` with `signer` (default: the client's
+    /// keypair) and assembles the result. `address_override` as in
+    /// [`UnsignedTransaction::from_runtime_call`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_runtime_call(
+        runtime_call: RuntimeCall,
+        max_fee: Option<u128>,
+        priority_fee_bips: Option<u64>,
+        gas_limit: Option<Gas>,
+        uniqueness: Option<UniquenessData>,
+        address_override: Option<Address>,
+        signer: Option<&Keypair>,
+        client: &Client,
+    ) -> SDKResult<SignedTransaction> {
+        let signer = signer
+            .or_else(|| client.keypair())
+            .ok_or(SDKError::MissingKeypair)?;
+
+        let max_fee = max_fee.unwrap_or_else(|| client.max_fee().0);
+        let priority_fee_bips =
+            priority_fee_bips.unwrap_or_else(|| client.max_priority_fee_bips().0);
+        let gas_limit = gas_limit.or_else(|| client.gas_limit());
+
+        let unsigned = UnsignedTransaction::from_runtime_call(
+            runtime_call,
+            max_fee,
+            priority_fee_bips,
+            gas_limit,
+            uniqueness,
+            address_override,
+            client,
+        )?;
+
+        let data = unsigned.to_bytes()?;
+        let sig_bytes: [u8; 64] = signer
+            .sign(&data)
+            .try_into()
+            .map_err(|v: Vec<u8>| SDKError::InvalidSignatureLength(v.len()))?;
+        let pub_key: [u8; 32] = signer
+            .public_key()
+            .try_into()
+            .map_err(|v: Vec<u8>| SDKError::InvalidPublicKeyLength(v.len()))?;
+
+        Ok(Self::from_parts(unsigned, sig_bytes, pub_key))
+    }
+
+    /// Assemble a signed transaction from an unsigned transaction, a 64-byte
+    /// Ed25519 signature, and a 32-byte public key.
+    ///
+    /// Use after signing the bytes from [`UnsignedTransaction::to_bytes`].
+    pub fn from_parts(
+        tx: UnsignedTransaction,
+        signature: [u8; 64],
+        pub_key: [u8; 32],
+    ) -> SignedTransaction {
+        tx.inner.into_signed(pub_key, signature)
+    }
+
+    /// Borsh-serialize a signed transaction to bytes.
+    ///
+    /// Useful for byte-level comparison of two signed transactions.
+    pub fn to_bytes(signed: &SignedTransaction) -> SDKResult<Vec<u8>> {
+        borsh::to_vec(signed).map_err(|e| SDKError::SerializationError(e.to_string()))
+    }
+
+    /// Borsh-serialize and base64-encode a signed transaction.
+    pub fn to_base64(signed: &SignedTransaction) -> SDKResult<String> {
+        let bytes = Self::to_bytes(signed)?;
+        Ok(BASE64.encode(&bytes))
+    }
+}
+
+/// Whether the signed call is a `DegenTrade`, which has its own trading API route.
+fn is_degen_trade(signed: &SignedTransaction) -> bool {
+    let SignedTransaction::V0(v0) = signed else {
+        return false;
+    };
+    matches!(
+        v0.runtime_call,
+        RuntimeCall::Exchange(CallMessage::User(UserAction::DegenTrade { .. }))
+    )
+}
+
+impl Client {
+    /// Send a signed transaction to the network.
+    ///
+    /// Returns the response from the sequencer.
+    pub async fn send_transaction(
+        &self,
+        signed: &SignedTransaction,
+    ) -> SDKResult<SubmitTxResponse> {
+        let body = Transaction::to_base64(signed)?;
+        let request = SubmitTxRequest { body };
+        // /tx/submit still carries DegenTrade, but /tx/submitDegen is where it is going.
+        let response = if is_degen_trade(signed) {
+            self.client().submit_degen_tx(&request).await
+        } else {
+            self.client().submit_tx(&request).await
+        };
+        match response {
+            Err(ErrorResponse(response)) if response.status() == 401 => {
+                let inner = response.into_inner();
+                Err(self.submit_tx_api_error(inner).await?)
+            }
+            Ok(r) => Ok(r.into_inner()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Send a Solana offchain transaction to the network.
+    ///
+    /// Submits to `/api/v1/solanaOffchainTx`, which proxies the JSON Solana authenticator payload
+    /// to the rollup.
+    pub async fn send_offchain_transaction(
+        &self,
+        signed: &SolanaOffchainTransaction,
+    ) -> SDKResult<SubmitTxResponse> {
+        self.submit_offchain(signed.to_base64()?).await
+    }
+
+    /// Send a Solana Ledger transaction to the network.
+    ///
+    /// Submits the spec-compliant wire format to the trading API's
+    /// `/api/v1/solanaOffchainTx`. Use after signing with
+    /// [`UnsignedTransaction::to_ledger_signable_bytes`] and assembling via
+    /// [`SolanaLedgerTransaction::from_parts`].
+    pub async fn send_ledger_transaction(
+        &self,
+        signed: &SolanaLedgerTransaction,
+    ) -> SDKResult<SubmitTxResponse> {
+        self.submit_offchain(signed.to_base64()).await
+    }
+
+    /// Submit a base64-encoded Solana offchain envelope via the trading API.
+    ///
+    /// Stale chain hashes map to [`SDKError::TransactionOutdated`] (rebuild and re-sign): a `400`
+    /// chain-hash mismatch or any `401` signature failure.
+    pub(crate) async fn submit_offchain(&self, body: String) -> SDKResult<SubmitTxResponse> {
+        let request = SubmitSolanaOffchainTxRequest { body };
+        match self.client().submit_solana_offchain_tx(&request).await {
+            Ok(r) => Ok(r.into_inner()),
+            Err(ErrorResponse(response)) => {
+                Err(self.submit_tx_api_error(response.into_inner()).await?)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Build, sign, and submit a call message, retrying once if the chain hash
+    /// changed since startup (401 signature failure → schema refresh → re-sign).
+    ///
+    /// Unlike calling `send_transaction` directly, this never returns
+    /// `TransactionOutdated` — the retry is handled internally, and if the
+    /// refreshed hash also fails the error is returned as `ApiError`.
+    pub async fn send_call_message(
+        &self,
+        call_message: CallMessage,
+    ) -> SDKResult<SubmitTxResponse> {
+        self.send_runtime_call(RuntimeCall::Exchange(call_message))
+            .await
+    }
+
+    /// Build, sign, and submit a runtime call in one step, retrying once if
+    /// the chain hash changed since startup.
+    pub async fn send_runtime_call(
+        &self,
+        runtime_call: RuntimeCall,
+    ) -> SDKResult<SubmitTxResponse> {
+        let signed = Transaction::from_runtime_call(
+            runtime_call.clone(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            self,
+        )?;
+        match self.send_transaction(&signed).await {
+            Err(SDKError::TransactionOutdated) => {
+                // Submit directly so a second 401 comes back as ApiError, not TransactionOutdated.
+                let signed = Transaction::from_runtime_call(
+                    runtime_call,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    self,
+                )?;
+                let body = Transaction::to_base64(&signed)?;
+                let request = SubmitTxRequest { body };
+                let retried = if is_degen_trade(&signed) {
+                    self.client().submit_degen_tx(&request).await
+                } else {
+                    self.client().submit_tx(&request).await
+                };
+                match retried {
+                    Ok(r) => Ok(r.into_inner()),
+                    Err(ErrorResponse(r)) => Err(SDKError::ApiError(Box::new(r.into_inner()))),
+                    Err(e) => Err(e.into()),
+                }
+            }
+            other => other,
+        }
+    }
+
+    async fn submit_tx_api_error(&self, error: ApiErrorResponse) -> SDKResult<SDKError> {
+        // Stale chain hash: the borsh path fails signature verification (401, message varies, so
+        // key on status); the offchain envelope validates the hash field (400 mismatch).
+        let stale_chain_hash = error.status == 401
+            || (error.status == 400 && {
+                let message = error.message.to_lowercase();
+                message.contains("chain_hash mismatch") || message.contains("chain hash mismatch")
+            });
+        if stale_chain_hash {
+            self.update_schema().await?;
+            return Ok(SDKError::TransactionOutdated);
+        }
+        Ok(SDKError::ApiError(Box::new(error)))
+    }
+}
+
+fn stringify_offchain_max_fee(
+    message: &mut serde_json::Map<String, Value>,
+    max_fee: u128,
+) -> SDKResult<()> {
+    let details = message
+        .get_mut("details")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| {
+            SDKError::SerializationError(
+                "unsigned transaction JSON missing object field details".to_string(),
+            )
+        })?;
+    let max_fee_value = details.get_mut("max_fee").ok_or_else(|| {
+        SDKError::SerializationError(
+            "unsigned transaction JSON missing field details.max_fee".to_string(),
+        )
+    })?;
+    *max_fee_value = Value::String(max_fee.to_string());
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use bullet_exchange_interface::message::{
+        CancelOrderArgs, DegenAction, PublicAction, UserAction,
+    };
+    use bullet_exchange_interface::schema::Schema;
+    use bullet_exchange_interface::transaction::{
+        Amount, PriorityFeeBips, RuntimeCall, Transaction as InterfaceTransaction, TxDetails,
+        UniquenessData, UnsignedTransaction as RawUnsignedTransaction, WarpBytes32, warp,
+    };
+    use bullet_exchange_interface::types::{MarketId, OrderId};
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+
+    fn warp_bytes32(value: &str) -> WarpBytes32 {
+        let raw = value.strip_prefix("0x").unwrap_or(value);
+        let mut bytes = [0u8; 32];
+        hex::decode_to_slice(raw, &mut bytes).unwrap();
+        WarpBytes32(bytes)
+    }
+
+    fn test_unsigned_tx() -> UnsignedTransaction {
+        let inner = RawUnsignedTransaction {
+            runtime_call: RuntimeCall::Exchange(CallMessage::Public(PublicAction::ApplyFunding {
+                addresses: vec![],
+            })),
+            uniqueness: UniquenessData::Generation(12345),
+            details: TxDetails {
+                chain_hash_fragment: 1,
+                max_fee: Amount(10_000_000),
+                gas_limit: None,
+                max_priority_fee_bips: PriorityFeeBips(0),
+            },
+            address_override: None,
+        };
+        UnsignedTransaction {
+            inner,
+            chain_hash: [42u8; 32],
+            chain_name: "TestChain".to_string(),
+        }
+    }
+
+    fn schema_response(chain_byte: u8) -> serde_json::Value {
+        let schema = Schema::of_single_type::<InterfaceTransaction>().unwrap();
+        serde_json::json!({
+            "chain_hash": format!("0x{}", hex::encode([chain_byte; 32])),
+            "schema": schema,
+        })
+    }
+
+    fn exchange_info_response() -> serde_json::Value {
+        serde_json::json!({
+            "assets": [],
+            "rateLimits": [],
+            "symbols": [],
+            "globalConfig": {
+                "maxOrdersPerUser": 0,
+                "maxTriggerOrdersPerUser": 0,
+                "maxTriggerOrdersToExecutePerMsg": 0,
+                "minNotionalTwapValue": "0",
+                "minNotionalTwapValuePerOrder": "0",
+                "twapExecutionIntervalSeconds": 0,
+            },
+            "globalVaultConfig": {
+                "leaderMinimumHoldingPercentage": 0,
+                "creationFeeUsdc": "0",
+                "minDepositValue": "0",
+            },
+        })
+    }
+
+    async fn mock_client_for_offchain_submission(
+        offchain_response: ResponseTemplate,
+    ) -> (MockServer, Client) {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/rollup/schema"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(schema_response(7)))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/fapi/v1/exchangeInfo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(exchange_info_response()))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/solanaOffchainTx"))
+            .respond_with(offchain_response)
+            .mount(&server)
+            .await;
+
+        let client = Client::builder()
+            .network(server.uri())
+            .build()
+            .await
+            .unwrap();
+
+        (server, client)
+    }
+
+    /// A `DegenTrade` goes to the route dedicated to it, every other call to `/tx/submit`.
+    #[tokio::test]
+    async fn the_submission_route_follows_the_signed_call_message() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rollup/schema"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(schema_response(7)))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/fapi/v1/exchangeInfo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(exchange_info_response()))
+            .mount(&server)
+            .await;
+        // each route answers with its own path, so the response names the one that was called
+        for route in ["/tx/submit", "/tx/submitDegen"] {
+            Mock::given(method("POST"))
+                .and(path(route))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": route,
+                    "status": "submitted",
+                })))
+                .mount(&server)
+                .await;
+        }
+
+        let client = Client::builder()
+            .network(server.uri())
+            .build()
+            .await
+            .unwrap();
+        let keypair = Keypair::generate();
+
+        let cases = [
+            (
+                CallMessage::User(UserAction::DegenTrade {
+                    market_id: MarketId(1),
+                    action: DegenAction::Close,
+                    sub_account_index: None,
+                }),
+                "/tx/submitDegen",
+            ),
+            (
+                CallMessage::Public(PublicAction::ApplyFunding { addresses: vec![] }),
+                "/tx/submit",
+            ),
+        ];
+
+        for (call_message, expected_route) in cases {
+            let signed = Transaction::builder()
+                .call_message(call_message)
+                .max_fee(10_000_000)
+                .signer(&keypair)
+                .client(&client)
+                .build()
+                .unwrap();
+
+            let response = client.send_transaction(&signed).await.unwrap();
+            assert_eq!(response.id, expected_route);
+        }
+    }
+
+    fn test_solana_offchain_transaction() -> SolanaOffchainTransaction {
+        let chain_hash = [7u8; 32];
+        SolanaOffchainTransaction {
+            signed_message: serde_json::json!({
+                "chain_name": "TestChain",
+            })
+            .to_string()
+            .into_bytes(),
+            chain_hash,
+            pubkey: [8u8; 32],
+            signature: [9u8; 64],
+        }
+    }
+
+    fn verify_signature(pub_key: [u8; 32], message: &[u8], signature: [u8; 64]) -> bool {
+        let verifying_key = VerifyingKey::from_bytes(&pub_key).unwrap();
+        let signature = Signature::from_bytes(&signature);
+        verifying_key.verify(message, &signature).is_ok()
+    }
+
+    #[test]
+    fn to_bytes_is_versioned_borsh_plus_chain_hash() {
+        let unsigned = test_unsigned_tx();
+        let bytes = unsigned.to_bytes().unwrap();
+
+        let mut expected = vec![0u8]; // V0 signing payload
+        expected.extend(borsh::to_vec(&unsigned.inner).unwrap());
+        expected.extend_from_slice(&unsigned.chain_hash);
+        assert_eq!(bytes, expected);
+    }
+
+    #[tokio::test]
+    async fn from_bytes_roundtrips_to_bytes() {
+        let (_server, client) =
+            mock_client_for_offchain_submission(ResponseTemplate::new(200)).await;
+
+        // schema_response(7) sets the client chain hash to [7u8; 32].
+        let inner = RawUnsignedTransaction {
+            runtime_call: RuntimeCall::Exchange(CallMessage::Public(PublicAction::ApplyFunding {
+                addresses: vec![],
+            })),
+            uniqueness: UniquenessData::Window(99),
+            details: TxDetails {
+                chain_hash_fragment: chain_hash_fragment(&client.chain_hash()),
+                max_fee: Amount(10_000_000),
+                gas_limit: None,
+                max_priority_fee_bips: PriorityFeeBips(0),
+            },
+            address_override: None,
+        };
+        let original = UnsignedTransaction {
+            inner,
+            chain_hash: client.chain_hash(),
+            chain_name: client.chain_name(),
+        };
+        let bytes = original.to_bytes().unwrap();
+
+        let restored = UnsignedTransaction::from_bytes(&bytes, &client).unwrap();
+
+        // Re-serializing the reconstructed tx yields byte-identical signable bytes.
+        assert_eq!(restored.to_bytes().unwrap(), bytes);
+        assert_eq!(restored.chain_hash, client.chain_hash());
+        assert_eq!(restored.chain_name, client.chain_name());
+    }
+
+    #[tokio::test]
+    async fn from_bytes_rejects_chain_hash_for_another_network() {
+        let (_server, client) =
+            mock_client_for_offchain_submission(ResponseTemplate::new(200)).await;
+
+        // Bytes whose trailing chain hash isn't the client's ([7u8; 32]).
+        let mut foreign = test_unsigned_tx();
+        foreign.chain_hash = [9u8; 32];
+        let bytes = foreign.to_bytes().unwrap();
+
+        let err = UnsignedTransaction::from_bytes(&bytes, &client).unwrap_err();
+        assert!(matches!(err, SDKError::InvalidChainHash(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn from_bytes_rejects_truncated_input() {
+        let (_server, client) =
+            mock_client_for_offchain_submission(ResponseTemplate::new(200)).await;
+
+        let err = UnsignedTransaction::from_bytes(&[0u8; 8], &client).unwrap_err();
+        assert!(matches!(err, SDKError::SerializationError(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn from_bytes_rejects_pre_fork_signable_bytes() {
+        let (_server, client) =
+            mock_client_for_offchain_submission(ResponseTemplate::new(200)).await;
+
+        // Pre-fork SDKs signed `borsh(unsigned_tx) ++ chain_hash`: no version
+        // byte, so the payload starts with the RuntimeCall discriminant.
+        let mut unsigned = test_unsigned_tx();
+        unsigned.chain_hash = client.chain_hash();
+        let mut pre_fork = borsh::to_vec(&unsigned.inner).unwrap();
+        assert_eq!(pre_fork[0], 7, "RuntimeCall::Exchange discriminant");
+        pre_fork.extend_from_slice(&unsigned.chain_hash);
+
+        let err = UnsignedTransaction::from_bytes(&pre_fork, &client).unwrap_err();
+        let SDKError::SerializationError(message) = err else {
+            panic!("expected SerializationError, got {err:?}");
+        };
+        assert!(message.contains("version byte"), "{message}");
+        assert!(message.contains("re-sign"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn builder_address_override_is_carried_in_borsh_and_json() {
+        let (_server, client) =
+            mock_client_for_offchain_submission(ResponseTemplate::new(200)).await;
+        let keypair = Keypair::generate();
+        let call_msg = CallMessage::Public(PublicAction::ApplyFunding { addresses: vec![] });
+        let override_address = Address([0xAB; 32]);
+
+        let unsigned = UnsignedTransaction::builder()
+            .call_message(call_msg.clone())
+            .max_fee(10_000_000)
+            .priority_fee_bips(0)
+            .address_override(override_address)
+            .client(&client)
+            .build()
+            .unwrap();
+        assert_eq!(unsigned.inner.address_override, Some(override_address));
+
+        // The Solana offchain JSON carries the override as a base58 string.
+        let message: serde_json::Value =
+            serde_json::from_slice(&unsigned.to_message_bytes().unwrap()).unwrap();
+        assert_eq!(
+            message["address_override"],
+            serde_json::Value::String(override_address.to_string())
+        );
+
+        // The signable bytes round-trip the override.
+        let restored =
+            UnsignedTransaction::from_bytes(&unsigned.to_bytes().unwrap(), &client).unwrap();
+        assert_eq!(restored.inner.address_override, Some(override_address));
+
+        // The signed transaction carries it in its Borsh bytes.
+        let signed = Transaction::builder()
+            .call_message(call_msg.clone())
+            .max_fee(10_000_000)
+            .address_override(override_address)
+            .signer(&keypair)
+            .client(&client)
+            .build()
+            .unwrap();
+        let SignedTransaction::V0(ref version_0) = signed else {
+            panic!("expected V0 signed transaction");
+        };
+        assert_eq!(version_0.address_override, Some(override_address));
+        let decoded: SignedTransaction =
+            borsh::from_slice(&Transaction::to_bytes(&signed).unwrap()).unwrap();
+        assert_eq!(decoded, signed);
+
+        // Omitting the override keeps the default (`None`, absent from JSON).
+        let unsigned = UnsignedTransaction::builder()
+            .call_message(call_msg)
+            .max_fee(10_000_000)
+            .priority_fee_bips(0)
+            .client(&client)
+            .build()
+            .unwrap();
+        assert_eq!(unsigned.inner.address_override, None);
+        let message: serde_json::Value =
+            serde_json::from_slice(&unsigned.to_message_bytes().unwrap()).unwrap();
+        assert!(message.get("address_override").is_none(), "{message}");
+    }
+
+    #[test]
+    fn to_display_message_renders_unsigned_payload_without_chain_hash() {
+        let unsigned = test_unsigned_tx();
+
+        let display = unsigned.to_display_message().unwrap();
+
+        assert!(display.contains("ApplyFunding"), "{display}");
+        assert!(display.contains("max_fee"), "{display}");
+        assert!(display.contains("10000000"), "{display}");
+        assert!(!display.contains("signature"), "{display}");
+    }
+
+    #[test]
+    fn to_message_bytes_serializes_readable_json() {
+        let unsigned = test_unsigned_tx();
+
+        let bytes = unsigned.to_message_bytes().unwrap();
+        let message: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(message["chain_name"], "TestChain");
+        assert_eq!(message["version"], 0);
+        assert!(message.get("address_override").is_none());
+        assert_eq!(message["uniqueness"]["generation"], 12345);
+        assert_eq!(message["details"]["chain_hash_fragment"], "1");
+        assert_eq!(message["details"]["max_fee"], "10000000");
+        assert!(message.get("runtime_call").is_some());
+    }
+
+    #[test]
+    fn to_message_bytes_omits_envelope_chain_hash() {
+        let unsigned = test_unsigned_tx();
+
+        let bytes = unsigned.to_message_bytes().unwrap();
+        let message: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert!(message.get("chain_hash").is_none());
+    }
+
+    #[test]
+    fn to_message_bytes_serializes_large_max_fee_as_string() {
+        let mut unsigned = test_unsigned_tx();
+        let max_fee = u128::from(u64::MAX) + 1;
+        unsigned.inner.details.max_fee = Amount(max_fee);
+
+        let bytes = unsigned.to_message_bytes().unwrap();
+        let message: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(message["details"]["max_fee"], max_fee.to_string());
+    }
+
+    #[test]
+    fn stringify_offchain_max_fee_errors_when_details_shape_changes() {
+        let mut message = serde_json::json!({
+            "runtime_call": {},
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let err = stringify_offchain_max_fee(&mut message, 1).unwrap_err();
+
+        assert!(err.to_string().contains("missing object field details"));
+    }
+
+    #[test]
+    fn stringify_offchain_max_fee_errors_when_max_fee_is_missing() {
+        let mut message = serde_json::json!({
+            "details": {
+                "chain_hash_fragment": "1",
+            },
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let err = stringify_offchain_max_fee(&mut message, 1).unwrap_err();
+
+        assert!(err.to_string().contains("missing field details.max_fee"));
+    }
+
+    #[test]
+    fn to_message_bytes_matches_solana_authenticator_json_numbers() {
+        let mut unsigned = test_unsigned_tx();
+        unsigned.inner.details.max_priority_fee_bips = PriorityFeeBips(u64::MAX);
+
+        let bytes = unsigned.to_message_bytes().unwrap();
+        let message: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(message["details"]["max_priority_fee_bips"], u64::MAX);
+        assert_eq!(message["details"]["chain_hash_fragment"], "1");
+        assert_eq!(message["uniqueness"]["generation"], 12345);
+    }
+
+    #[test]
+    fn to_message_bytes_serializes_order_ids_as_json_numbers() {
+        let inner = RawUnsignedTransaction {
+            runtime_call: RuntimeCall::Exchange(CallMessage::User(UserAction::CancelOrders {
+                market_id: MarketId(0),
+                orders: vec![CancelOrderArgs {
+                    order_id: Some(OrderId(10_000_000_000)),
+                    client_order_id: None,
+                }],
+                sub_account_index: None,
+            })),
+            uniqueness: UniquenessData::Generation(12345),
+            details: TxDetails {
+                chain_hash_fragment: 1,
+                max_fee: Amount(10_000_000),
+                gas_limit: None,
+                max_priority_fee_bips: PriorityFeeBips(0),
+            },
+            address_override: None,
+        };
+        let unsigned = UnsignedTransaction {
+            inner,
+            chain_hash: [42u8; 32],
+            chain_name: "TestChain".to_string(),
+        };
+
+        let bytes = unsigned.to_message_bytes().unwrap();
+        let message: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(
+            message["runtime_call"]["exchange"]["user"]["cancel_orders"]["orders"][0]["order_id"],
+            10_000_000_000u64
+        );
+    }
+
+    #[test]
+    fn to_message_bytes_serializes_warp_transfer_remote_runtime_call() {
+        let warp_route = "0x1111111111111111111111111111111111111111111111111111111111111111";
+        let recipient = "0x2222222222222222222222222222222222222222222222222222222222222222";
+        let relayer = "11111111111111111111111111111111"
+            .parse::<bullet_exchange_interface::address::Address>()
+            .unwrap();
+        let inner = RawUnsignedTransaction {
+            runtime_call: RuntimeCall::Warp(warp::CallMessage::TransferRemote {
+                warp_route: warp_bytes32(warp_route),
+                destination_domain: 1234,
+                recipient: warp_bytes32(recipient),
+                amount: Amount(12_345_678_901_234_567_890),
+                relayer: Some(relayer),
+                gas_payment_limit: Amount(400_000),
+            }),
+            uniqueness: UniquenessData::Window(42),
+            details: TxDetails {
+                chain_hash_fragment: 1,
+                max_fee: Amount(10_000_000),
+                gas_limit: None,
+                max_priority_fee_bips: PriorityFeeBips(0),
+            },
+            address_override: None,
+        };
+        let unsigned = UnsignedTransaction {
+            inner,
+            chain_hash: [42u8; 32],
+            chain_name: "TestChain".to_string(),
+        };
+
+        let bytes = unsigned.to_message_bytes().unwrap();
+        let message: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(
+            message["runtime_call"],
+            serde_json::json!({
+                "warp": {
+                    "transfer_remote": {
+                        "warp_route": warp_route,
+                        "destination_domain": 1234,
+                        "recipient": recipient,
+                        "amount": "12345678901234567890",
+                        "relayer": "11111111111111111111111111111111",
+                        "gas_payment_limit": "400000",
+                    }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn make_solana_preamble_layout() {
+        let pubkey = [1u8; 32];
+        let chain_hash = [2u8; 32];
+        let message_length: u16 = 0x1234;
+
+        let preamble = make_solana_preamble(&[pubkey], &chain_hash, message_length);
+
+        assert_eq!(preamble.len(), 85);
+        // signing domain: 0xff + "solana offchain"
+        assert_eq!(preamble[0], 0xff);
+        assert_eq!(&preamble[1..16], b"solana offchain");
+        // header_version = 0
+        assert_eq!(preamble[16], 0);
+        // application_domain = chain_hash
+        assert_eq!(&preamble[17..49], &chain_hash);
+        // message_format = 0
+        assert_eq!(preamble[49], 0);
+        // signer_count = 1
+        assert_eq!(preamble[50], 1);
+        // pubkey
+        assert_eq!(&preamble[51..83], &pubkey);
+        // message_length LE
+        assert_eq!(&preamble[83..85], &message_length.to_le_bytes());
+    }
+
+    #[test]
+    fn to_ledger_signable_bytes_errors_when_json_exceeds_u16() {
+        let pub_key = [1u8; 32];
+        let mut unsigned = test_unsigned_tx();
+        // Inject a payload large enough to exceed u16::MAX bytes when serialized
+        unsigned.inner.runtime_call =
+            RuntimeCall::Exchange(CallMessage::Public(PublicAction::ApplyFunding {
+                addresses: vec![
+                    bullet_exchange_interface::address::Address([0u8; 32]);
+                    3000 // ~3000 * ~44 bytes each ≈ 132 KB > 65535
+                ],
+            }));
+
+        let err = unsigned.to_ledger_signable_bytes(&pub_key).unwrap_err();
+        assert!(err.to_string().contains("too large"), "{err}");
+    }
+
+    #[test]
+    fn to_ledger_signable_bytes_is_preamble_plus_json() {
+        let keypair = Keypair::generate();
+        let pub_key: [u8; 32] = keypair.public_key().try_into().unwrap();
+        let unsigned = test_unsigned_tx();
+
+        let json_bytes = unsigned.to_message_bytes().unwrap();
+        let signable = unsigned.to_ledger_signable_bytes(&pub_key).unwrap();
+
+        assert_eq!(signable.len(), 85 + json_bytes.len());
+        assert_eq!(&signable[85..], json_bytes.as_slice());
+        // Preamble starts with signing domain
+        assert_eq!(signable[0], 0xff);
+        assert_eq!(&signable[1..16], b"solana offchain");
+    }
+
+    #[test]
+    fn solana_ledger_transaction_wire_format() {
+        let keypair = Keypair::generate();
+        let pub_key: [u8; 32] = keypair.public_key().try_into().unwrap();
+        let unsigned = test_unsigned_tx();
+
+        let signable = unsigned.to_ledger_signable_bytes(&pub_key).unwrap();
+        let signature: [u8; 64] = keypair.sign(&signable).try_into().unwrap();
+
+        let tx =
+            SolanaLedgerTransaction::from_parts(test_unsigned_tx(), pub_key, signature).unwrap();
+
+        let wire = tx.to_bytes();
+        // first 4 bytes: LE u32 message length
+        let len = u32::from_le_bytes(wire[0..4].try_into().unwrap()) as usize;
+        assert_eq!(len, tx.signed_message.len());
+        assert_eq!(&wire[4..4 + len], tx.signed_message.as_slice());
+        assert_eq!(&wire[4 + len..], &signature);
+    }
+
+    #[test]
+    fn solana_ledger_signature_verifies_against_signable_bytes() {
+        let keypair = Keypair::generate();
+        let pub_key: [u8; 32] = keypair.public_key().try_into().unwrap();
+        let unsigned = test_unsigned_tx();
+
+        let signable = unsigned.to_ledger_signable_bytes(&pub_key).unwrap();
+        let signature: [u8; 64] = keypair.sign(&signable).try_into().unwrap();
+
+        let tx =
+            SolanaLedgerTransaction::from_parts(test_unsigned_tx(), pub_key, signature).unwrap();
+
+        assert!(verify_signature(pub_key, &tx.signed_message, tx.signature));
+        // Must NOT verify against plain JSON bytes
+        let json_bytes = test_unsigned_tx().to_message_bytes().unwrap();
+        assert!(!verify_signature(pub_key, &json_bytes, tx.signature));
+    }
+
+    #[tokio::test]
+    async fn send_ledger_transaction_requires_resign_on_invalid_signature() {
+        let (server, client) = mock_client_for_offchain_submission(
+            ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "status": 401,
+                "message": "Invalid signature",
+            })),
+        )
+        .await;
+
+        let keypair = Keypair::generate();
+        let pub_key: [u8; 32] = keypair.public_key().try_into().unwrap();
+        let unsigned = test_unsigned_tx();
+        let signable = unsigned.to_ledger_signable_bytes(&pub_key).unwrap();
+        let signature: [u8; 64] = keypair.sign(&signable).try_into().unwrap();
+        let tx =
+            SolanaLedgerTransaction::from_parts(test_unsigned_tx(), pub_key, signature).unwrap();
+
+        let err = client.send_ledger_transaction(&tx).await.unwrap_err();
+
+        assert!(matches!(err, SDKError::TransactionOutdated), "{err:?}");
+        let requests = server.received_requests().await.unwrap();
+        let schema_requests = requests
+            .iter()
+            .filter(|request| request.url.path() == "/rollup/schema")
+            .count();
+        assert_eq!(schema_requests, 2);
+    }
+
+    #[tokio::test]
+    async fn send_offchain_transaction_maps_trading_api_validator_401_to_outdated() {
+        // The 401 message text varies; detection must key on the status.
+        let (server, client) = mock_client_for_offchain_submission(
+            ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "status": 401,
+                "message": "Transaction validation failed: invalid ed25519 signature",
+            })),
+        )
+        .await;
+        let signed = test_solana_offchain_transaction();
+
+        let err = client.send_offchain_transaction(&signed).await.unwrap_err();
+
+        assert!(matches!(err, SDKError::TransactionOutdated), "{err:?}");
+        let requests = server.received_requests().await.unwrap();
+        let schema_requests = requests
+            .iter()
+            .filter(|request| request.url.path() == "/rollup/schema")
+            .count();
+        assert_eq!(schema_requests, 2);
+    }
+
+    #[tokio::test]
+    async fn send_ledger_transaction_maps_chain_hash_mismatch_to_outdated() {
+        // The offchain envelope carries the chain hash as a validated field, so
+        // a stale hash comes back as a 400 (not a 401) — still "rebuild & re-sign".
+        let (server, client) = mock_client_for_offchain_submission(
+            ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "status": 400,
+                "message": "chain_hash mismatch",
+            })),
+        )
+        .await;
+
+        let keypair = Keypair::generate();
+        let pub_key: [u8; 32] = keypair.public_key().try_into().unwrap();
+        let signable = test_unsigned_tx()
+            .to_ledger_signable_bytes(&pub_key)
+            .unwrap();
+        let signature: [u8; 64] = keypair.sign(&signable).try_into().unwrap();
+        let tx =
+            SolanaLedgerTransaction::from_parts(test_unsigned_tx(), pub_key, signature).unwrap();
+
+        let err = client.send_ledger_transaction(&tx).await.unwrap_err();
+
+        assert!(matches!(err, SDKError::TransactionOutdated), "{err:?}");
+        let requests = server.received_requests().await.unwrap();
+        let schema_requests = requests
+            .iter()
+            .filter(|request| request.url.path() == "/rollup/schema")
+            .count();
+        assert_eq!(schema_requests, 2);
+    }
+
+    #[tokio::test]
+    async fn signed_builder_defaults_to_window_uniqueness() {
+        let (_server, client) =
+            mock_client_for_offchain_submission(ResponseTemplate::new(200)).await;
+        let keypair = Keypair::generate();
+
+        let signed = Transaction::builder()
+            .call_message(CallMessage::Public(PublicAction::ApplyFunding {
+                addresses: vec![],
+            }))
+            .max_fee(10_000_000)
+            .signer(&keypair)
+            .client(&client)
+            .build()
+            .unwrap();
+
+        let SignedTransaction::V0(version_0) = signed else {
+            panic!("expected V0 signed transaction");
+        };
+        assert!(
+            matches!(version_0.uniqueness, UniquenessData::Window(_)),
+            "{:?}",
+            version_0.uniqueness
+        );
+    }
+
+    #[tokio::test]
+    async fn send_ledger_multisig_transaction_posts_base64_envelope() {
+        let (server, client) = mock_client_for_offchain_submission(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "0xabc",
+                "status": "submitted",
+            })),
+        )
+        .await;
+
+        let mut keypairs: Vec<Keypair> = (0..3).map(|_| Keypair::generate()).collect();
+        keypairs.sort_by_key(|kp| kp.public_key());
+        let pubkeys: Vec<[u8; 32]> = keypairs
+            .iter()
+            .map(|kp| kp.public_key().try_into().unwrap())
+            .collect();
+        let config = crate::multisig::MultisigConfig::new(2, pubkeys).unwrap();
+
+        let mut tx =
+            crate::multisig::SolanaLedgerMultisigTransaction::new(test_unsigned_tx(), config)
+                .unwrap();
+        for keypair in &keypairs[..2] {
+            let pubkey: [u8; 32] = keypair.public_key().try_into().unwrap();
+            let signature: [u8; 64] = keypair.sign(tx.signable_bytes()).try_into().unwrap();
+            tx.add_signature(pubkey, signature).unwrap();
+        }
+
+        let response = client.send_ledger_multisig_transaction(&tx).await.unwrap();
+
+        assert_eq!(response.id, "0xabc");
+        let requests = server.received_requests().await.unwrap();
+        let submit = requests
+            .iter()
+            .find(|request| request.url.path() == "/api/v1/solanaOffchainTx")
+            .expect("expected a submission request");
+        let body: serde_json::Value = serde_json::from_slice(&submit.body).unwrap();
+        assert_eq!(body["body"], tx.to_base64().unwrap());
+    }
+
+    #[test]
+    fn solana_offchain_transaction_wraps_signed_json_message() {
+        let keypair = Keypair::generate();
+        let unsigned = test_unsigned_tx();
+
+        let signable = unsigned.to_message_bytes().unwrap();
+        let signature: [u8; 64] = keypair.sign(&signable).try_into().unwrap();
+        let pub_key: [u8; 32] = keypair.public_key().try_into().unwrap();
+
+        let tx = SolanaOffchainTransaction::from_parts(unsigned, signature, pub_key).unwrap();
+
+        assert_eq!(tx.signed_message, signable);
+        assert_eq!(tx.chain_hash, [42u8; 32]);
+        assert_eq!(tx.pubkey, pub_key);
+        assert_eq!(tx.signature, signature);
+        assert!(!tx.to_base64().unwrap().is_empty());
+
+        let roundtrip: SolanaOffchainTransaction =
+            borsh::from_slice(&tx.to_bytes().unwrap()).expect("should deserialize");
+        assert_eq!(roundtrip, tx);
+    }
+
+    #[test]
+    fn signed_transaction_signature_verifies_against_borsh_bytes() {
+        let keypair = Keypair::generate();
+        let unsigned = test_unsigned_tx();
+
+        let signable = unsigned.to_bytes().unwrap();
+        let signature: [u8; 64] = keypair.sign(&signable).try_into().unwrap();
+        let pub_key: [u8; 32] = keypair.public_key().try_into().unwrap();
+
+        let signed = Transaction::from_parts(unsigned, signature, pub_key);
+        let SignedTransaction::V0(version_0) = signed else {
+            panic!("expected V0 signed transaction");
+        };
+
+        assert!(verify_signature(
+            version_0.pub_key,
+            &signable,
+            version_0.signature
+        ));
+    }
+
+    #[test]
+    fn solana_offchain_signature_verifies_against_message_bytes_only() {
+        let keypair = Keypair::generate();
+        let unsigned = test_unsigned_tx();
+
+        let message = unsigned.to_message_bytes().unwrap();
+        let borsh_bytes = unsigned.to_bytes().unwrap();
+        let signature: [u8; 64] = keypair.sign(&message).try_into().unwrap();
+        let pub_key: [u8; 32] = keypair.public_key().try_into().unwrap();
+
+        let tx = SolanaOffchainTransaction::from_parts(unsigned, signature, pub_key).unwrap();
+
+        assert!(verify_signature(
+            tx.pubkey,
+            &tx.signed_message,
+            tx.signature
+        ));
+        assert!(!verify_signature(tx.pubkey, &borsh_bytes, tx.signature));
+    }
+
+    #[tokio::test]
+    async fn send_offchain_transaction_requires_resign_on_invalid_signature() {
+        let (server, client) = mock_client_for_offchain_submission(
+            ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "status": 401,
+                "message": "Invalid signature",
+            })),
+        )
+        .await;
+        let signed = test_solana_offchain_transaction();
+
+        let err = client.send_offchain_transaction(&signed).await.unwrap_err();
+
+        assert!(matches!(err, SDKError::TransactionOutdated), "{err:?}");
+        let requests = server.received_requests().await.unwrap();
+        let schema_requests = requests
+            .iter()
+            .filter(|request| request.url.path() == "/rollup/schema")
+            .count();
+        assert_eq!(schema_requests, 2);
+    }
+
+    #[tokio::test]
+    async fn builder_uniqueness_nonce_and_window_serialize_to_json() {
+        let (_server, client) =
+            mock_client_for_offchain_submission(ResponseTemplate::new(200)).await;
+        let call_msg = CallMessage::Public(PublicAction::ApplyFunding { addresses: vec![] });
+
+        let unsigned = UnsignedTransaction::builder()
+            .call_message(call_msg.clone())
+            .max_fee(10_000_000)
+            .priority_fee_bips(0)
+            .uniqueness(UniquenessData::Nonce(7))
+            .client(&client)
+            .build()
+            .unwrap();
+        let message: serde_json::Value =
+            serde_json::from_slice(&unsigned.to_message_bytes().unwrap()).unwrap();
+        assert_eq!(message["uniqueness"]["nonce"], 7);
+
+        let unsigned = UnsignedTransaction::builder()
+            .call_message(call_msg)
+            .max_fee(10_000_000)
+            .priority_fee_bips(0)
+            .uniqueness(UniquenessData::Window(99))
+            .client(&client)
+            .build()
+            .unwrap();
+        let message: serde_json::Value =
+            serde_json::from_slice(&unsigned.to_message_bytes().unwrap()).unwrap();
+        assert_eq!(message["uniqueness"]["window"], 99);
+    }
+
+    #[tokio::test]
+    async fn builder_defaults_to_window_uniqueness() {
+        let (_server, client) =
+            mock_client_for_offchain_submission(ResponseTemplate::new(200)).await;
+        let call_msg = CallMessage::Public(PublicAction::ApplyFunding { addresses: vec![] });
+
+        let unsigned = UnsignedTransaction::builder()
+            .call_message(call_msg)
+            .max_fee(10_000_000)
+            .priority_fee_bips(0)
+            .client(&client)
+            .build()
+            .unwrap();
+        let message: serde_json::Value =
+            serde_json::from_slice(&unsigned.to_message_bytes().unwrap()).unwrap();
+        assert!(message["uniqueness"]["window"].is_u64(), "{message}");
+    }
+
+    #[tokio::test]
+    async fn builder_default_window_nonce_increments_per_tx() {
+        let (_server, client) =
+            mock_client_for_offchain_submission(ResponseTemplate::new(200)).await;
+        let call_msg = CallMessage::Public(PublicAction::ApplyFunding { addresses: vec![] });
+
+        let window_of = |client: &Client| -> u64 {
+            let unsigned = UnsignedTransaction::builder()
+                .call_message(call_msg.clone())
+                .max_fee(10_000_000)
+                .priority_fee_bips(0)
+                .client(client)
+                .build()
+                .unwrap();
+            match unsigned.inner.uniqueness {
+                UniquenessData::Window(w) => w,
+                other => panic!("expected Window, got {other:?}"),
+            }
+        };
+
+        let first = window_of(&client);
+        let second = window_of(&client);
+        assert_eq!(
+            second,
+            first + 1,
+            "window nonce must monotonically increment"
+        );
+    }
+
+    #[test]
+    fn from_parts_matches_direct_construction() {
+        let keypair = Keypair::generate();
+        let unsigned = test_unsigned_tx();
+
+        let signable = unsigned.to_bytes().unwrap();
+        let sig: [u8; 64] = keypair.sign(&signable).try_into().unwrap();
+        let pk: [u8; 32] = keypair.public_key().try_into().unwrap();
+
+        // Reconstruct for direct comparison (from_parts consumes unsigned)
+        let chain_hash = unsigned.chain_hash;
+        let inner_clone = RawUnsignedTransaction {
+            runtime_call: unsigned.inner.runtime_call.clone(),
+            uniqueness: unsigned.inner.uniqueness.clone(),
+            details: unsigned.inner.details.clone(),
+            address_override: None,
+        };
+        let assembled = Transaction::from_parts(unsigned, sig, pk);
+
+        // Direct construction over the interface's signing payload
+        let data = inner_clone.signing_bytes(&chain_hash);
+        let sig2: [u8; 64] = keypair.sign(&data).try_into().unwrap();
+        let direct = inner_clone.into_signed(pk, sig2);
+
+        assert_eq!(assembled, direct);
+        assert_eq!(
+            Transaction::to_bytes(&assembled).unwrap(),
+            Transaction::to_bytes(&direct).unwrap(),
+        );
+    }
+
+    #[test]
+    fn signed_to_bytes_roundtrips() {
+        let keypair = Keypair::generate();
+        let unsigned = test_unsigned_tx();
+
+        let signable = unsigned.to_bytes().unwrap();
+        let sig: [u8; 64] = keypair.sign(&signable).try_into().unwrap();
+        let pk: [u8; 32] = keypair.public_key().try_into().unwrap();
+        let signed = Transaction::from_parts(unsigned, sig, pk);
+
+        let bytes = Transaction::to_bytes(&signed).unwrap();
+        assert!(!bytes.is_empty());
+
+        let deserialized: SignedTransaction =
+            borsh::from_slice(&bytes).expect("should deserialize");
+        assert_eq!(bytes, Transaction::to_bytes(&deserialized).unwrap());
+    }
+
+    #[test]
+    fn to_base64_is_nonempty() {
+        let keypair = Keypair::generate();
+        let unsigned = test_unsigned_tx();
+
+        let signable = unsigned.to_bytes().unwrap();
+        let sig: [u8; 64] = keypair.sign(&signable).try_into().unwrap();
+        let pk: [u8; 32] = keypair.public_key().try_into().unwrap();
+        let signed = Transaction::from_parts(unsigned, sig, pk);
+
+        assert!(!Transaction::to_base64(&signed).unwrap().is_empty());
+    }
+
+    #[cfg(feature = "integration")]
+    mod integration {
+        use bullet_exchange_interface::message::PublicAction;
+
+        use super::*;
+        use crate::Network;
+
+        #[tokio::test]
+        async fn test_builder_build() {
+            let network = std::env::var("BULLET_API_ENDPOINT")
+                .map(|e| Network::from(e.as_str()))
+                .unwrap_or(Network::Mainnet);
+
+            let client = Client::builder()
+                .network(network)
+                .build()
+                .await
+                .expect("could not connect");
+            let keypair = Keypair::generate();
+
+            let call_msg = CallMessage::Public(PublicAction::ApplyFunding { addresses: vec![] });
+
+            let signed = Transaction::builder()
+                .call_message(call_msg)
+                .max_fee(10_000_000)
+                .signer(&keypair)
+                .client(&client)
+                .build()
+                .expect("Failed to build transaction");
+
+            assert!(!Transaction::to_base64(&signed).unwrap().is_empty());
+        }
+    }
+}

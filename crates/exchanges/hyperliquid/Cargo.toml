@@ -1,0 +1,28 @@
+[package]
+name = "bb-exchange-hyperliquid"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Hyperliquid exchange adapter for bullet-bots"
+
+[lints]
+workspace = true
+
+[dependencies]
+bb-core = { workspace = true }
+hyperliquid_rust_sdk = { workspace = true }
+ethers = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+rust_decimal = { workspace = true }
+secrecy = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+uuid = { version = "1", features = ["v5"] }
+
+[dev-dependencies]
+toml = { workspace = true }
+
+[lib]
+doctest = false

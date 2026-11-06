@@ -1,0 +1,44 @@
+# Funding rate arbitrage bot: Bullet x Hyperliquid
+# Run with: cargo run --bin bb-bot -- run --config config/funding-arb-example.toml
+
+[engine]
+tick_interval_ms = 10000
+status_port = 3031
+
+[exchanges.bullet]
+type = "bullet"
+network = "testnet"   # match where your delegate was created: testnet (app.testnet.bullet.xyz) or mainnet (app.bullet.xyz)
+# Key material — do NOT put private keys in this file.
+# Option 1 (preferred): key_file = "/path/to/id.key"  (run `bb-bot keygen`)
+# Option 2: export BB_BULLET_PRIVATE_KEY="..."  (base58 from the delegate UI, or hex)
+
+[exchanges.hyperliquid]
+type = "hyperliquid"
+network = "testnet"   # match where your API wallet was created: testnet or mainnet (app.hyperliquid.xyz)
+# Key material — do NOT put private keys in this file.
+#   export BB_HYPERLIQUID_PRIVATE_KEY="0x..."   # API-wallet key (signs orders)
+#   export BB_HYPERLIQUID_ACCOUNT_ADDRESS="0x..."   # your MAIN account (reads
+#       positions/balances/fills). Required for an API wallet; omit only if the
+#       key above is your main wallet's own key.
+
+[strategy]
+type = "funding-arb"
+
+[strategy.funding-arb]
+symbol = "BTC-USD"
+exchange_a = "bullet"
+exchange_b = "hyperliquid"
+entry_threshold = "0.0005"          # 0.05%/hr (~43% APR)
+exit_threshold = "0.0001"           # 0.01%/hr (~8.7% APR)
+order_size = "0.01"                 # BTC per leg
+max_delta_imbalance = "0.005"       # emergency flatten if net delta > 0.005 BTC
+max_funding_rate = "0.005"          # reject rates > 0.5%/hr (anomalous)
+order_mode = "aggressive"           # IoC at best opposing + slippage
+phase_timeout_secs = 30
+slippage = "0.001"                  # 0.1%
+# Minimum seconds to remain Flat after a cycle completes before re-entering.
+# Stops rapid re-entry when spread wobbles around the entry threshold.
+min_flat_hold_secs = 60
+
+[logging]
+level = "info"

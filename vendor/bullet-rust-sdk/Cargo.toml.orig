@@ -1,0 +1,86 @@
+[package]
+name = "bullet-rust-sdk"
+version = "0.0.43"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/bulletxyz/bullet-rust-sdk"
+description = "Rust SDK for the Bullet trading platform"
+homepage = "https://www.bullet.xyz"
+readme = "../README.md"
+keywords = ["bullet", "trading", "exchange", "sdk"]
+categories = ["api-bindings", "cryptography::cryptocurrencies"]
+links = "bullet_rust_codegen"
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bullet-exchange-interface = { version = "=0.15.3", features = ["schema"] }
+bullet-ws-interface = "0.2"
+
+
+progenitor-client = "0.14"
+reqwest = { version = "0.13", features = ["blocking"] }
+rust_decimal = { version = "1", features = ["serde-with-str"] }
+serde = "1"
+strum = { version = "0.28", features = ["derive"] }
+serde_json = { version = "1.0.133", features = ["arbitrary_precision", "preserve_order"] }
+futures = "0.3"
+thiserror = "2"
+url = "2"
+
+# Signing
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+rand = "0.8"
+borsh = "1"
+hex = "0.4"
+base64 = "0.23"
+sha2 = "0.10"
+
+# WebSocket (works on both native and WASM)
+reqwest-websocket = { version = "0.6", features = ["json"] }
+tracing = "0.1.41"
+
+# Cross-platform time (std::time::Instant panics on WASM)
+web-time = "1.1"
+bon = "3.9.0"
+
+# Cross-platform async timer (works on both native and WASM)
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+futures-timer = "3"
+tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+futures-timer = { version = "3", features = ["wasm-bindgen"] }
+wasm-bindgen-futures = "0.4"
+# Declared to switch on its "js" feature for transitive users; never imported here.
+getrandom = { version = "0.2", features = ["js"] }
+
+[build-dependencies]
+progenitor = "0.14"
+serde_json = "1.0"
+reqwest = { version = "0.13", features = ["blocking"] }
+openapiv3 = "2"
+schemars = "0.8"
+syn = { version = "2.0", features = ["full", "extra-traits"] }
+prettyplease = "0.2"
+
+[dev-dependencies]
+tokio = { version = "=1.53.1", features = ["rt", "macros", "io-std", "io-util"] }
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
+wiremock = "=0.6.5"
+
+[features]
+default = []
+# enable integration tests that require a local instance running
+integration = []
+
+# Declared to enable a feature rather than imported.
+[package.metadata.cargo-shear]
+ignored = ["getrandom"]
+
+[lints]
+workspace = true
